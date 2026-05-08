@@ -1,4 +1,5 @@
 pub mod api;
+pub mod provider;
 pub mod app;
 pub mod app_event;
 pub mod commands;

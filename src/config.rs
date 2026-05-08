@@ -1,43 +1,136 @@
-use anyhow::{Context, Result, anyhow};
+use std::collections::BTreeMap;
 
-use crate::api::{ApiConfig, DEFAULT_MODEL};
-use crate::user_config::UserConfig;
+use anyhow::{Context, Result, anyhow, bail};
 
+use crate::{
+    logger,
+    provider::Provider,
+    user_config::{self, UserConfig},
+};
+
+const DEFAULT_SYSTEM_PROMPT: &str = "You and the user are having a conversation. This is not a user-assistant interaction, simply a conversation between two minds.";
+const DEFAULT_MAX_TOKENS: u32 = 8192;
+
+#[derive(Clone, Debug)]
 pub struct Config {
-    pub base_url: String,
-    pub custom_headers: Vec<(String, String)>,
+    pub provider: Provider,
+    pub origin: String,
+    pub api_key: Option<String>,
     pub model: String,
+    pub system_prompt: String,
+    pub max_tokens: u32,
+    pub custom_headers: BTreeMap<String, String>,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let base_url = std::env::var("CHATTER_BASE_URL")
-            .context("CHATTER_BASE_URL environment variable is not set")?;
-        let base_url = base_url.trim_end_matches('/').to_string();
+        let config_dir = user_config::config_dir()?;
+        if !config_dir.join("config.toml").exists()
+            && config_dir.join("config.json").exists()
+        {
+            logger::warn(format_args!(
+                "found stale {} — create config.toml to configure chatter",
+                config_dir.join("config.json").display()
+            ));
+        }
 
-        let custom_headers = match std::env::var("CHATTER_CUSTOM_HEADERS").ok() {
-            Some(raw) => parse_custom_headers(&raw)?,
-            None => vec![],
+        let user_cfg = UserConfig::load()?;
+
+        let profile_name = std::env::var("CHATTER_PROFILE")
+            .ok()
+            .or_else(|| user_cfg.active.clone());
+
+        let profile = match &profile_name {
+            Some(name) => {
+                let p = user_cfg.profile.get(name).ok_or_else(|| {
+                    anyhow!("active profile \"{name}\" is not defined in config.toml")
+                })?;
+                Some(p)
+            }
+            None => None,
         };
 
-        let env_model = std::env::var("CHATTER_MODEL").ok();
-        let file_model = UserConfig::load()?.model;
-        let model = resolve_model(env_model, file_model, DEFAULT_MODEL);
+        let provider: Provider = if let Ok(s) = std::env::var("CHATTER_PROVIDER") {
+            s.parse().context("invalid CHATTER_PROVIDER")?
+        } else if let Some(p) = profile.map(|p| p.provider) {
+            p
+        } else {
+            Provider::Anthropic
+        };
+
+        let raw_origin = std::env::var("CHATTER_ORIGIN")
+            .ok()
+            .or_else(|| profile.and_then(|p| p.origin.clone()))
+            .unwrap_or_else(|| provider.default_origin().to_string());
+        let origin = validate_origin(&raw_origin)?;
+
+        let api_key = std::env::var("CHATTER_API_KEY")
+            .ok()
+            .or_else(|| profile.and_then(|p| p.api_key.clone()));
+
+        let model = std::env::var("CHATTER_MODEL")
+            .ok()
+            .or_else(|| profile.and_then(|p| p.model.clone()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| provider.default_model().to_string());
+
+        let system_prompt = std::env::var("CHATTER_SYSTEM_PROMPT")
+            .ok()
+            .or_else(|| profile.and_then(|p| p.system_prompt.clone()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+
+        let max_tokens = std::env::var("CHATTER_MAX_TOKENS")
+            .ok()
+            .map(|s| s.parse::<u32>().context("invalid CHATTER_MAX_TOKENS"))
+            .transpose()?
+            .or_else(|| profile.and_then(|p| p.max_tokens))
+            .unwrap_or(DEFAULT_MAX_TOKENS);
+
+        let mut custom_headers: BTreeMap<String, String> = profile
+            .map(|p| p.custom_headers.clone())
+            .unwrap_or_default();
+        if let Ok(raw) = std::env::var("CHATTER_CUSTOM_HEADERS") {
+            for (k, v) in parse_custom_headers(&raw)? {
+                custom_headers.insert(k, v);
+            }
+        }
+
+        let has_auth = api_key.is_some()
+            || custom_headers.keys().any(|k| {
+                let k = k.to_lowercase();
+                k == "authorization" || k == "x-api-key"
+            });
+        if !has_auth {
+            logger::warn(format_args!(
+                "no API key configured; set api_key in config.toml or CHATTER_API_KEY"
+            ));
+        }
 
         Ok(Self {
-            base_url,
-            custom_headers,
+            provider,
+            origin,
+            api_key,
             model,
+            system_prompt,
+            max_tokens,
+            custom_headers,
         })
     }
+}
 
-    pub fn api_config(&self) -> ApiConfig {
-        ApiConfig {
-            base_url: self.base_url.clone(),
-            custom_headers: self.custom_headers.clone(),
-            model: self.model.clone(),
-        }
+/// Accepts `scheme://host` or `scheme://host:port`. Rejects URLs with a path component.
+/// Strips a trailing slash for convenience.
+fn validate_origin(origin: &str) -> Result<String> {
+    let origin = origin.trim_end_matches('/');
+    let host_start = origin.find("://").map(|i| i + 3).unwrap_or(0);
+    if origin[host_start..].contains('/') {
+        bail!(
+            "origin must be scheme://host or scheme://host:port, not a full URL with a path \
+             (got: {origin}). The API path is chosen automatically per provider."
+        );
     }
+    Ok(origin.to_string())
 }
 
 fn parse_custom_headers(raw: &str) -> Result<Vec<(String, String)>> {
@@ -62,54 +155,13 @@ fn parse_custom_headers(raw: &str) -> Result<Vec<(String, String)>> {
     Ok(headers)
 }
 
-fn resolve_model(env: Option<String>, file: Option<String>, default: &str) -> String {
-    env.or(file).unwrap_or_else(|| default.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn api_config_clones_config_values() {
-        let config = Config {
-            base_url: "https://example.com/v1".to_string(),
-            custom_headers: vec![("X-Key".to_string(), "secret".to_string())],
-            model: "model".to_string(),
-        };
-
-        let api_config = config.api_config();
-
-        assert_eq!(api_config.base_url, "https://example.com/v1");
-        assert_eq!(api_config.custom_headers, vec![("X-Key".to_string(), "secret".to_string())]);
-        assert_eq!(api_config.model, "model");
-    }
-
-    #[test]
-    fn env_model_beats_file_model() {
-        let model = resolve_model(
-            Some("env-model".to_string()),
-            Some("file-model".to_string()),
-            "default",
-        );
-        assert_eq!(model, "env-model");
-    }
-
-    #[test]
-    fn file_model_used_when_env_missing() {
-        let model = resolve_model(None, Some("file-model".to_string()), "default");
-        assert_eq!(model, "file-model");
-    }
-
-    #[test]
-    fn default_used_when_env_and_file_missing() {
-        let model = resolve_model(None, None, "default");
-        assert_eq!(model, "default");
-    }
-
-    #[test]
     fn parse_custom_headers_empty_string() {
-        assert_eq!(parse_custom_headers("").unwrap(), vec![]);
+        assert!(parse_custom_headers("").unwrap().is_empty());
     }
 
     #[test]
@@ -168,5 +220,35 @@ mod tests {
     fn parse_custom_headers_empty_name_errors() {
         let err = parse_custom_headers("=value").unwrap_err();
         assert!(err.to_string().contains("empty header name"), "{err}");
+    }
+
+    #[test]
+    fn validate_origin_accepts_bare_host() {
+        assert_eq!(
+            validate_origin("https://api.anthropic.com").unwrap(),
+            "https://api.anthropic.com"
+        );
+    }
+
+    #[test]
+    fn validate_origin_strips_trailing_slash() {
+        assert_eq!(
+            validate_origin("https://api.anthropic.com/").unwrap(),
+            "https://api.anthropic.com"
+        );
+    }
+
+    #[test]
+    fn validate_origin_accepts_port() {
+        assert_eq!(
+            validate_origin("http://localhost:8080").unwrap(),
+            "http://localhost:8080"
+        );
+    }
+
+    #[test]
+    fn validate_origin_rejects_path_component() {
+        let err = validate_origin("https://api.anthropic.com/v1").unwrap_err();
+        assert!(err.to_string().contains("path"), "{err}");
     }
 }

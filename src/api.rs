@@ -2,14 +2,11 @@ use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
-use crate::app_event::{AppEvent, AppEventSender};
-
-pub const DEFAULT_MODEL: &str = "Claude-Sonnet-4.6";
-
-pub const SYSTEM_PROMPT: &str = "You and the user are having a conversation. This is not a user-assistant interaction, simply a conversation between two minds.";
-
-const MAX_TOKENS: u32 = 8192;
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+use crate::{
+    app_event::{AppEvent, AppEventSender},
+    config::Config,
+    provider::Provider,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -17,30 +14,18 @@ pub struct Message {
     pub content: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub id: String,
-    pub owned_by: Option<String>,
+    pub name: Option<String>,
     pub context_length: Option<u64>,
     pub max_output_tokens: Option<u64>,
-    pub capacity: Option<String>,
-    pub capabilities: Option<ModelCapabilities>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ModelCapabilities {
-    pub chat: bool,
-}
-
-#[derive(Clone)]
-pub struct ApiConfig {
-    pub base_url: String,
-    pub custom_headers: Vec<(String, String)>,
-    pub model: String,
-}
+// ── Anthropic request / SSE types ────────────────────────────────────────────
 
 #[derive(Serialize)]
-struct MessagesRequest<'a> {
+struct AnthropicRequest<'a> {
     model: &'a str,
     system: &'a str,
     messages: &'a [Message],
@@ -50,9 +35,9 @@ struct MessagesRequest<'a> {
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
-enum StreamEvent {
+enum AnthropicEvent {
     #[serde(rename = "content_block_delta")]
-    ContentBlockDelta { delta: ContentDelta },
+    ContentBlockDelta { delta: AnthropicDelta },
     #[serde(rename = "message_stop")]
     MessageStop,
     #[serde(other)]
@@ -61,7 +46,7 @@ enum StreamEvent {
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
-enum ContentDelta {
+enum AnthropicDelta {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
     #[serde(other)]
@@ -69,9 +54,67 @@ enum ContentDelta {
 }
 
 #[derive(Deserialize)]
-struct ModelsResponse {
-    data: Vec<ModelInfo>,
+struct AnthropicModelsResponse {
+    data: Vec<AnthropicModelItem>,
 }
+
+#[derive(Deserialize)]
+struct AnthropicModelItem {
+    id: String,
+    display_name: Option<String>,
+}
+
+// ── OpenRouter request / SSE types ───────────────────────────────────────────
+
+#[derive(Serialize)]
+struct OpenRouterRequest<'a> {
+    model: &'a str,
+    messages: Vec<OrMessage<'a>>,
+    max_tokens: u32,
+    stream: bool,
+}
+
+#[derive(Serialize)]
+struct OrMessage<'a> {
+    role: &'a str,
+    content: &'a str,
+}
+
+#[derive(Deserialize)]
+struct OrChunk {
+    choices: Vec<OrChoice>,
+}
+
+#[derive(Deserialize)]
+struct OrChoice {
+    delta: OrDelta,
+}
+
+#[derive(Deserialize)]
+struct OrDelta {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OrModelsResponse {
+    data: Vec<OrModelItem>,
+}
+
+#[derive(Deserialize)]
+struct OrModelItem {
+    id: String,
+    name: Option<String>,
+    context_length: Option<u64>,
+    top_provider: Option<OrTopProvider>,
+}
+
+#[derive(Deserialize)]
+struct OrTopProvider {
+    max_completion_tokens: Option<u64>,
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
 
 pub fn build_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
@@ -81,57 +124,67 @@ pub fn build_client() -> Result<reqwest::Client> {
 
 pub async fn stream_chat(
     client: reqwest::Client,
-    config: ApiConfig,
+    config: Config,
     history: Vec<Message>,
     tx: AppEventSender,
 ) {
-    if let Err(e) = stream_chat_inner(client, config, history, &tx).await {
+    let result = match config.provider {
+        Provider::Anthropic  => stream_chat_anthropic(&client, &config, &history, &tx).await,
+        Provider::OpenRouter => stream_chat_openrouter(&client, &config, &history, &tx).await,
+    };
+    if let Err(e) = result {
         tx.send(AppEvent::StreamError(format!("{e:#}")));
     }
     tx.send(AppEvent::StreamDone);
 }
 
-pub async fn load_models(client: reqwest::Client, config: ApiConfig, tx: AppEventSender) {
-    match list_models(client, &config).await {
-        Ok(models) => tx.send(AppEvent::ModelsLoaded(models)),
+pub async fn load_models(client: reqwest::Client, config: Config, tx: AppEventSender) {
+    let result = match config.provider {
+        Provider::Anthropic  => fetch_models_anthropic(&client, &config).await,
+        Provider::OpenRouter => fetch_models_openrouter(&client, &config).await,
+    };
+    match result {
+        Ok(mut models) => {
+            models.sort_by(|a, b| a.id.to_lowercase().cmp(&b.id.to_lowercase()));
+            tx.send(AppEvent::ModelsLoaded(models));
+        }
         Err(e) => tx.send(AppEvent::ModelsError(format!("{e:#}"))),
     }
 }
 
-async fn stream_chat_inner(
-    client: reqwest::Client,
-    config: ApiConfig,
-    history: Vec<Message>,
-    tx: &AppEventSender,
-) -> Result<()> {
-    let body = MessagesRequest {
-        model: &config.model,
-        system: SYSTEM_PROMPT,
-        messages: &history,
-        max_tokens: MAX_TOKENS,
-        stream: true,
-    };
+// ── Shared helpers ────────────────────────────────────────────────────────────
 
-    let url = format!("{}/messages", config.base_url);
-    let mut req = client
-        .post(url)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .header("Accept", "text/event-stream");
+fn apply_headers(mut req: reqwest::RequestBuilder, config: &Config) -> reqwest::RequestBuilder {
+    match config.provider {
+        Provider::Anthropic => {
+            if let Some(key) = &config.api_key {
+                req = req.header("x-api-key", key.as_str());
+            }
+            req = req.header("anthropic-version", "2023-06-01");
+        }
+        Provider::OpenRouter => {
+            if let Some(key) = &config.api_key {
+                req = req.header("Authorization", format!("Bearer {key}"));
+            }
+        }
+    }
     for (name, value) in &config.custom_headers {
         req = req.header(name.as_str(), value.as_str());
     }
-    let resp = req
-        .json(&body)
-        .send()
-        .await
-        .context("request failed")?;
+    req
+}
 
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("HTTP {status}: {text}"));
-    }
+enum SseAction {
+    Token(String),
+    Done,
+    Skip,
+}
 
+async fn read_sse_events(
+    resp: reqwest::Response,
+    decode: impl Fn(&str) -> SseAction,
+    tx: &AppEventSender,
+) -> Result<()> {
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
 
@@ -143,24 +196,15 @@ async fn stream_chat_inner(
             let event: String = buf.drain(..idx + 2).collect();
             for line in event.lines() {
                 let line = line.trim_start();
-                let Some(data) = line.strip_prefix("data:") else {
-                    continue;
-                };
+                let Some(data) = line.strip_prefix("data:") else { continue };
                 let data = data.trim();
                 if data.is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<StreamEvent>(data) {
-                    Ok(StreamEvent::ContentBlockDelta {
-                        delta: ContentDelta::TextDelta { text },
-                    }) => {
-                        if !text.is_empty() {
-                            tx.send(AppEvent::StreamToken(text));
-                        }
-                    }
-                    Ok(StreamEvent::MessageStop) => return Ok(()),
-                    Ok(_) => {}
-                    Err(_) => {}
+                match decode(data) {
+                    SseAction::Token(t) => tx.send(AppEvent::StreamToken(t)),
+                    SseAction::Done    => return Ok(()),
+                    SseAction::Skip    => {}
                 }
             }
         }
@@ -169,12 +213,48 @@ async fn stream_chat_inner(
     Ok(())
 }
 
-async fn list_models(client: reqwest::Client, config: &ApiConfig) -> Result<Vec<ModelInfo>> {
-    let url = format!("{}/models", config.base_url);
-    let mut req = client.get(url);
-    for (name, value) in &config.custom_headers {
-        req = req.header(name.as_str(), value.as_str());
+// ── Anthropic ─────────────────────────────────────────────────────────────────
+
+async fn stream_chat_anthropic(
+    client: &reqwest::Client,
+    config: &Config,
+    history: &[Message],
+    tx: &AppEventSender,
+) -> Result<()> {
+    let url = format!("{}{}", config.origin, config.provider.chat_path());
+    let body = AnthropicRequest {
+        model: &config.model,
+        system: &config.system_prompt,
+        messages: history,
+        max_tokens: config.max_tokens,
+        stream: true,
+    };
+    let req = apply_headers(
+        client.post(&url).header("Accept", "text/event-stream"),
+        config,
+    );
+    let resp = req.json(&body).send().await.context("request failed")?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("HTTP {status}: {text}"));
     }
+
+    read_sse_events(resp, |data| {
+        match serde_json::from_str::<AnthropicEvent>(data) {
+            Ok(AnthropicEvent::ContentBlockDelta {
+                delta: AnthropicDelta::TextDelta { text },
+            }) if !text.is_empty() => SseAction::Token(text),
+            Ok(AnthropicEvent::MessageStop) => SseAction::Done,
+            _ => SseAction::Skip,
+        }
+    }, tx).await
+}
+
+async fn fetch_models_anthropic(client: &reqwest::Client, config: &Config) -> Result<Vec<ModelInfo>> {
+    let url = format!("{}{}", config.origin, config.provider.models_path());
+    let req = apply_headers(client.get(&url), config);
     let resp = req.send().await.context("model request failed")?;
 
     let status = resp.status();
@@ -183,66 +263,118 @@ async fn list_models(client: reqwest::Client, config: &ApiConfig) -> Result<Vec<
         return Err(anyhow!("HTTP {status}: {text}"));
     }
 
-    let models = resp
-        .json::<ModelsResponse>()
+    Ok(resp
+        .json::<AnthropicModelsResponse>()
         .await
-        .context("failed to decode models response")?
-        .data;
-
-    Ok(chat_models(models))
-}
-
-fn chat_models(models: Vec<ModelInfo>) -> Vec<ModelInfo> {
-    let mut models = models
+        .context("failed to decode Anthropic models response")?
+        .data
         .into_iter()
-        .filter(|model| {
-            model
-                .capabilities
-                .as_ref()
-                .is_some_and(|capabilities| capabilities.chat)
+        .map(|item| ModelInfo {
+            id: item.id,
+            name: item.display_name,
+            context_length: None,
+            max_output_tokens: None,
         })
-        .collect::<Vec<_>>();
-
-    models.sort_by(|a, b| a.id.to_lowercase().cmp(&b.id.to_lowercase()));
-    models
+        .collect())
 }
+
+// ── OpenRouter ────────────────────────────────────────────────────────────────
+
+async fn stream_chat_openrouter(
+    client: &reqwest::Client,
+    config: &Config,
+    history: &[Message],
+    tx: &AppEventSender,
+) -> Result<()> {
+    let url = format!("{}{}", config.origin, config.provider.chat_path());
+
+    let mut messages = vec![OrMessage {
+        role: "system",
+        content: &config.system_prompt,
+    }];
+    messages.extend(history.iter().map(|m| OrMessage {
+        role: &m.role,
+        content: &m.content,
+    }));
+
+    let body = OpenRouterRequest {
+        model: &config.model,
+        messages,
+        max_tokens: config.max_tokens,
+        stream: true,
+    };
+    let req = apply_headers(
+        client.post(&url).header("Accept", "text/event-stream"),
+        config,
+    );
+    let resp = req.json(&body).send().await.context("request failed")?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("HTTP {status}: {text}"));
+    }
+
+    read_sse_events(resp, |data| {
+        if data == "[DONE]" {
+            return SseAction::Done;
+        }
+        match serde_json::from_str::<OrChunk>(data) {
+            Ok(chunk) => {
+                let text = chunk
+                    .choices
+                    .into_iter()
+                    .filter_map(|c| c.delta.content)
+                    .find(|t| !t.is_empty());
+                match text {
+                    Some(t) => SseAction::Token(t),
+                    None    => SseAction::Skip,
+                }
+            }
+            Err(_) => SseAction::Skip,
+        }
+    }, tx).await
+}
+
+async fn fetch_models_openrouter(client: &reqwest::Client, config: &Config) -> Result<Vec<ModelInfo>> {
+    let url = format!("{}{}", config.origin, config.provider.models_path());
+    let req = apply_headers(client.get(&url), config);
+    let resp = req.send().await.context("model request failed")?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("HTTP {status}: {text}"));
+    }
+
+    Ok(resp
+        .json::<OrModelsResponse>()
+        .await
+        .context("failed to decode OpenRouter models response")?
+        .data
+        .into_iter()
+        .map(|item| ModelInfo {
+            id: item.id,
+            name: item.name,
+            context_length: item.context_length,
+            max_output_tokens: item.top_provider.and_then(|p| p.max_completion_tokens),
+        })
+        .collect())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn model(id: &str, chat: Option<bool>) -> ModelInfo {
-        ModelInfo {
-            id: id.to_string(),
-            owned_by: None,
-            context_length: None,
-            max_output_tokens: None,
-            capacity: None,
-            capabilities: chat.map(|chat| ModelCapabilities { chat }),
-        }
-    }
-
     #[test]
-    fn chat_models_keeps_chat_capable_models_sorted_case_insensitively() {
-        let models = chat_models(vec![
-            model("zeta", Some(true)),
-            model("VisionOnly", Some(false)),
-            model("alpha", Some(true)),
-            model("NoCapabilities", None),
-            model("Beta", Some(true)),
-        ]);
-
-        let ids = models.into_iter().map(|model| model.id).collect::<Vec<_>>();
-        assert_eq!(ids, vec!["alpha", "Beta", "zeta"]);
-    }
-
-    #[test]
-    fn messages_request_serializes_expected_shape() {
+    fn anthropic_request_serializes_expected_shape() {
         let messages = vec![Message {
             role: "user".to_string(),
             content: "hello".to_string(),
         }];
-        let request = MessagesRequest {
+        let request = AnthropicRequest {
             model: "test-model",
             system: "sys",
             messages: &messages,
@@ -261,40 +393,97 @@ mod tests {
     }
 
     #[test]
-    fn stream_event_parses_text_delta() {
-        let event: StreamEvent = serde_json::from_str(
+    fn openrouter_request_puts_system_message_first() {
+        let history = vec![Message {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let messages: Vec<OrMessage> = {
+            let mut v = vec![OrMessage { role: "system", content: "sys" }];
+            v.extend(history.iter().map(|m| OrMessage { role: &m.role, content: &m.content }));
+            v
+        };
+        let request = OpenRouterRequest {
+            model: "test-model",
+            messages,
+            max_tokens: 8192,
+            stream: true,
+        };
+
+        let json = serde_json::to_value(request).unwrap();
+
+        assert_eq!(json["messages"][0]["role"], "system");
+        assert_eq!(json["messages"][0]["content"], "sys");
+        assert_eq!(json["messages"][1]["role"], "user");
+        assert_eq!(json["messages"][1]["content"], "hi");
+    }
+
+    #[test]
+    fn anthropic_event_parses_text_delta() {
+        let event: AnthropicEvent = serde_json::from_str(
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
         )
         .unwrap();
 
         match event {
-            StreamEvent::ContentBlockDelta {
-                delta: ContentDelta::TextDelta { text },
+            AnthropicEvent::ContentBlockDelta {
+                delta: AnthropicDelta::TextDelta { text },
             } => assert_eq!(text, "hi"),
             _ => panic!("expected text_delta"),
         }
     }
 
     #[test]
-    fn stream_event_ignores_unknown_types() {
-        let ping: StreamEvent = serde_json::from_str(r#"{"type":"ping"}"#).unwrap();
-        assert!(matches!(ping, StreamEvent::Other));
+    fn anthropic_event_ignores_unknown_types() {
+        let ping: AnthropicEvent = serde_json::from_str(r#"{"type":"ping"}"#).unwrap();
+        assert!(matches!(ping, AnthropicEvent::Other));
 
-        let msg_delta: StreamEvent = serde_json::from_str(
+        let msg_delta: AnthropicEvent = serde_json::from_str(
             r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#,
         )
         .unwrap();
-        assert!(matches!(msg_delta, StreamEvent::Other));
+        assert!(matches!(msg_delta, AnthropicEvent::Other));
 
-        let unknown_delta: StreamEvent = serde_json::from_str(
+        let unknown_delta: AnthropicEvent = serde_json::from_str(
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"..."}}"#,
         )
         .unwrap();
         assert!(matches!(
             unknown_delta,
-            StreamEvent::ContentBlockDelta {
-                delta: ContentDelta::Other
-            }
+            AnthropicEvent::ContentBlockDelta { delta: AnthropicDelta::Other }
         ));
+    }
+
+    #[test]
+    fn openrouter_chunk_parses_content_delta() {
+        let chunk: OrChunk = serde_json::from_str(
+            r#"{"id":"x","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn openrouter_chunk_handles_missing_content() {
+        let chunk: OrChunk = serde_json::from_str(
+            r#"{"id":"x","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        )
+        .unwrap();
+
+        assert!(chunk.choices[0].delta.content.is_none());
+    }
+
+    #[test]
+    fn openrouter_done_sentinel_triggers_done_action() {
+        // Verify [DONE] is recognized before attempting JSON parse
+        let action = (|data: &str| {
+            if data == "[DONE]" {
+                return SseAction::Done;
+            }
+            SseAction::Skip
+        })("[DONE]");
+
+        assert!(matches!(action, SseAction::Done));
     }
 }

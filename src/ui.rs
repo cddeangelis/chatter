@@ -462,17 +462,14 @@ fn render_picker_list(app: &App, buf: &mut Buffer, area: Rect) {
 
 fn format_model_meta(model: &ModelInfo) -> String {
     let mut parts = Vec::new();
-    if let Some(owner) = model.owned_by.as_deref().filter(|s| !s.is_empty()) {
-        parts.push(format!("owned: {owner}"));
+    if let Some(name) = model.name.as_deref().filter(|s| !s.is_empty()) {
+        parts.push(name.to_string());
     }
     if let Some(ctx) = model.context_length {
         parts.push(format!("ctx: {}", short_count(ctx)));
     }
     if let Some(max) = model.max_output_tokens {
         parts.push(format!("max-out: {}", short_count(max)));
-    }
-    if let Some(cap) = model.capacity.as_deref().filter(|s| !s.is_empty()) {
-        parts.push(format!("cap: {cap}"));
     }
     parts.join(" · ")
 }

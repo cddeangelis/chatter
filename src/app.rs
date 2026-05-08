@@ -458,11 +458,9 @@ mod tests {
     fn model(id: &str) -> ModelInfo {
         ModelInfo {
             id: id.to_string(),
-            owned_by: None,
+            name: None,
             context_length: None,
             max_output_tokens: None,
-            capacity: None,
-            capabilities: None,
         }
     }
 

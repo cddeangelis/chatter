@@ -1,13 +1,13 @@
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::api::Message;
+use crate::{api::Message, user_config::{config_dir, home_dir}};
 
 #[derive(Clone, Debug)]
 pub enum SessionCommand {
@@ -137,31 +137,12 @@ fn validate_uuid(id: &str) -> Result<()> {
     }
 }
 
-pub(crate) fn config_dir() -> Result<PathBuf> {
-    if let Some(value) = std::env::var_os("CHATTER_CONFIG_DIR") {
-        if !value.is_empty() {
-            return Ok(PathBuf::from(value));
-        }
-    }
-    Ok(home_dir()?.join(".chatter"))
-}
-
-fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .filter(|path| Path::new(path).is_absolute())
-        .ok_or_else(|| anyhow!("HOME is not set to an absolute path"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     const ID: &str = "123e4567-e89b-12d3-a456-426614174000";
     const OTHER_ID: &str = "123e4567-e89b-12d3-a456-426614174001";
@@ -254,52 +235,6 @@ mod tests {
         assert!(store.load(ID).is_err());
 
         let _ = fs::remove_dir_all(&store.dir);
-    }
-
-    #[test]
-    fn config_dir_uses_env_override_when_set() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("CHATTER_CONFIG_DIR");
-        unsafe { std::env::set_var("CHATTER_CONFIG_DIR", "/tmp/custom-chatter-dir") };
-
-        assert_eq!(
-            config_dir().unwrap(),
-            PathBuf::from("/tmp/custom-chatter-dir")
-        );
-
-        match prev {
-            Some(v) => unsafe { std::env::set_var("CHATTER_CONFIG_DIR", v) },
-            None => unsafe { std::env::remove_var("CHATTER_CONFIG_DIR") },
-        }
-    }
-
-    #[test]
-    fn config_dir_falls_back_to_home_dot_chatter_when_unset() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("CHATTER_CONFIG_DIR");
-        unsafe { std::env::remove_var("CHATTER_CONFIG_DIR") };
-
-        let dir = config_dir().unwrap();
-        assert_eq!(dir, home_dir().unwrap().join(".chatter"));
-
-        if let Some(v) = prev {
-            unsafe { std::env::set_var("CHATTER_CONFIG_DIR", v) };
-        }
-    }
-
-    #[test]
-    fn config_dir_treats_empty_env_var_as_unset() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("CHATTER_CONFIG_DIR");
-        unsafe { std::env::set_var("CHATTER_CONFIG_DIR", "") };
-
-        let dir = config_dir().unwrap();
-        assert_eq!(dir, home_dir().unwrap().join(".chatter"));
-
-        match prev {
-            Some(v) => unsafe { std::env::set_var("CHATTER_CONFIG_DIR", v) },
-            None => unsafe { std::env::remove_var("CHATTER_CONFIG_DIR") },
-        }
     }
 
     #[test]

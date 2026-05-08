@@ -7,9 +7,10 @@ use ratatui::{layout::Rect, text::Line};
 use tokio::time::{Instant as TokioInstant, Sleep, interval, sleep_until};
 
 use crate::{
-    api::{self, ApiConfig},
+    api,
     app::{App, ViewMode},
     app_event::{AppEvent, AppEventSender},
+    config::Config,
     logger,
     session::{self, SessionState, SessionStore},
     terminal::{self, Tui},
@@ -20,18 +21,18 @@ use crate::{
 pub async fn run(
     terminal: &mut Tui,
     client: reqwest::Client,
-    mut api_config: ApiConfig,
+    mut config: Config,
     mut session_state: SessionState,
     session_store: SessionStore,
 ) -> Result<String> {
-    api_config.model = session_state.model.clone();
+    config.model = session_state.model.clone();
     logger::info(format_args!(
         "runtime starting session={} model={}",
-        session_state.id, api_config.model
+        session_state.id, config.model
     ));
 
     let mut app = App::with_messages(
-        api_config.model.clone(),
+        config.model.clone(),
         session_state.messages.clone(),
         Some(&session_state.id),
     );
@@ -46,7 +47,7 @@ pub async fn run(
         terminal,
         ui::render_session_banner(&format!(
             "session: {} · model: {}",
-            session_state.id, api_config.model
+            session_state.id, config.model
         )),
     )?;
     if !app.messages.is_empty() {
@@ -94,7 +95,7 @@ pub async fn run(
                     terminal,
                     &tx,
                     &client,
-                    &mut api_config,
+                    &mut config,
                     &session_store,
                     &mut session_state,
                     &mut persist_gate,
@@ -160,7 +161,7 @@ fn handle_app_event(
     terminal: &mut Tui,
     tx: &AppEventSender,
     client: &reqwest::Client,
-    api_config: &mut ApiConfig,
+    config: &mut Config,
     session_store: &SessionStore,
     session_state: &mut SessionState,
     persist_gate: &mut PersistGate,
@@ -173,7 +174,6 @@ fn handle_app_event(
         }
         AppEvent::Clear => {
             logger::info(format_args!("clear requested model={}", app.current_model));
-            // Flush the outgoing session before swapping it out.
             persist_gate.flush(session_store, session_state, app);
             match session_store.create(&app.current_model) {
                 Ok(new_state) => {
@@ -184,7 +184,7 @@ fn handle_app_event(
                         terminal,
                         ui::render_session_banner(&format!(
                             "session: {} · model: {}",
-                            session_state.id, api_config.model
+                            session_state.id, config.model
                         )),
                     )?;
                 }
@@ -198,7 +198,7 @@ fn handle_app_event(
             logger::info(format_args!(
                 "submitting prompt bytes={} model={}",
                 text.len(),
-                api_config.model
+                config.model
             ));
             push_lines(terminal, ui::render_user_message(&text))?;
             app.push_user(text);
@@ -208,7 +208,7 @@ fn handle_app_event(
             let history = app.messages.clone();
             let tx2 = tx.clone();
             let client2 = client.clone();
-            let cfg = api_config.clone();
+            let cfg = config.clone();
             tokio::spawn(async move {
                 api::stream_chat(client2, cfg, history, tx2).await;
             });
@@ -217,16 +217,16 @@ fn handle_app_event(
             logger::info(format_args!("loading models"));
             let tx2 = tx.clone();
             let client2 = client.clone();
-            let cfg = api_config.clone();
+            let cfg = config.clone();
             tokio::spawn(async move {
                 api::load_models(client2, cfg, tx2).await;
             });
         }
         AppEvent::SelectModel(model) => {
             logger::info(format_args!("model selected {model}"));
-            api_config.model = model.clone();
+            config.model = model.clone();
             persist_gate.flush(session_store, session_state, app);
-            if let Err(error) = user_config::set_model(&model) {
+            if let Err(error) = user_config::persist_active_model(&model) {
                 logger::error(format_args!("user config save error: {error:#}"));
                 app.set_error(format!("config save failed: {error:#}"));
             }
@@ -253,16 +253,14 @@ fn handle_app_event(
             persist_gate.flush(session_store, session_state, app);
         }
         AppEvent::ModelsLoaded(models) => {
-            logger::info(format_args!("loaded {} chat models", models.len()));
+            logger::info(format_args!("loaded {} models", models.len()));
             app.set_models(models);
         }
         AppEvent::ModelsError(e) => {
             logger::error(format_args!("model load error: {e}"));
             app.set_model_load_error(e);
         }
-        AppEvent::Resize => {
-            // Ratatui's autoresize handles viewport reshape on the next draw.
-        }
+        AppEvent::Resize => {}
     }
     Ok(true)
 }
@@ -306,8 +304,6 @@ fn is_picker_open(app: &App) -> bool {
     matches!(app.mode, ViewMode::ModelPicker)
 }
 
-/// Resize the inline viewport so the input box has room for its wrapped text
-/// plus the borders and status row. No-op in fullscreen modes (model picker).
 fn reshape_for_input(terminal: &mut crate::terminal::Tui, app: &App) -> Result<()> {
     if matches!(app.mode, ViewMode::ModelPicker) {
         return Ok(());
@@ -329,9 +325,6 @@ fn persist_session(store: &SessionStore, state: &mut SessionState, app: &App) {
     }
 }
 
-/// Throttles session writes during streaming. Forces a write on
-/// Submit/Clear/SelectModel/Done/Error/Quit and on abnormal loop exit;
-/// during StreamToken bursts, persists at most once per second.
 struct PersistGate {
     last_flush: Instant,
     pending: bool,

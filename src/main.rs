@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
     let result = runtime::run(
         &mut terminal,
         client,
-        config.api_config(),
+        config,
         session_state,
         session_store,
     )
