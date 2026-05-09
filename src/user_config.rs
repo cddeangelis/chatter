@@ -5,6 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +66,11 @@ impl UserConfig {
         if let Err(error) = fs::write(&tmp, &text) {
             let _ = fs::remove_file(&tmp);
             return Err(error).with_context(|| format!("write {}", tmp.display()));
+        }
+        #[cfg(unix)]
+        if let Err(error) = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error).with_context(|| format!("chmod {}", tmp.display()));
         }
         if let Err(error) = fs::rename(&tmp, path) {
             let _ = fs::remove_file(&tmp);
