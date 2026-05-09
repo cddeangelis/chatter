@@ -3,9 +3,8 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap},
+    widgets::{Block, BorderType, Borders, Paragraph, StatefulWidgetRef, Widget, Wrap},
 };
-use unicode_width::UnicodeWidthChar;
 
 use crate::{
     api::ModelInfo,
@@ -36,7 +35,7 @@ mod palette {
     pub const SELECTED_BG: Color = Color::Rgb(54, 42, 36);
 }
 
-pub fn render(app: &App, f: &mut Frame) {
+pub fn render(app: &mut App, f: &mut Frame) {
     let area = f.area();
     if area.height < 4 || area.width < 12 {
         return;
@@ -53,7 +52,7 @@ pub fn render(app: &App, f: &mut Frame) {
     }
 
     let text_width = input_text_width(area.width);
-    let input_rows = input_visual_rows(&app.input, text_width);
+    let input_rows = app.input.desired_height(text_width);
     let input_height = input_rows.saturating_add(2);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -161,7 +160,7 @@ pub fn render_session_banner(text: &str) -> Vec<Line<'static>> {
     ]
 }
 
-fn render_input(app: &App, f: &mut Frame, area: Rect) {
+fn render_input(app: &mut App, f: &mut Frame, area: Rect) {
     let prompt_glyph = if app.streaming { "…" } else { "›" };
     let prompt_color = if app.streaming {
         palette::MUTED
@@ -185,45 +184,43 @@ fn render_input(app: &App, f: &mut Frame, area: Rect) {
         palette::ACCENT_DIM
     };
 
-    let text_width = input_text_width(area.width);
-    let layout = wrap_input(&app.input, app.cursor, text_width);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+    let inner = block.inner(area);
+    block.render(area, f.buffer_mut());
+
     let prompt_style = Style::default()
         .fg(prompt_color)
         .add_modifier(Modifier::BOLD);
     let indent: String = " ".repeat(PROMPT_PREFIX_WIDTH as usize);
-    let lines: Vec<Line> = layout
-        .rows
-        .iter()
-        .enumerate()
-        .map(|(row_idx, row_text)| {
-            let leading = if row_idx == 0 {
-                Span::styled(prefix.clone(), prompt_style)
-            } else {
-                Span::raw(indent.clone())
-            };
-            Line::from(vec![leading, Span::styled(row_text.clone(), input_style)])
-        })
-        .collect();
+    let text_width = inner.width.saturating_sub(PROMPT_PREFIX_WIDTH).max(1);
+    let row_count = app.input.desired_height(text_width);
+    for r in 0..row_count.min(inner.height) {
+        let (leading, style) = if r == 0 {
+            (prefix.as_str(), prompt_style)
+        } else {
+            (indent.as_str(), Style::default())
+        };
+        f.buffer_mut()
+            .set_string(inner.x, inner.y + r, leading, style);
+    }
 
-    let input = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(border_color)),
-    );
-    f.render_widget(input, area);
+    let text_rect = Rect {
+        x: inner.x + PROMPT_PREFIX_WIDTH,
+        y: inner.y,
+        width: inner.width.saturating_sub(PROMPT_PREFIX_WIDTH),
+        height: inner.height,
+    };
+
+    f.buffer_mut().set_style(text_rect, input_style);
+    (&app.input).render_ref(text_rect, f.buffer_mut(), &mut app.input_state);
 
     if !app.streaming && matches!(app.mode, ViewMode::Chat) {
-        let cursor_x = area
-            .x
-            .saturating_add(1)
-            .saturating_add(PROMPT_PREFIX_WIDTH)
-            .saturating_add(layout.cursor_col);
-        let cursor_y = area.y.saturating_add(1).saturating_add(layout.cursor_row);
-        f.set_cursor_position(Position {
-            x: cursor_x,
-            y: cursor_y,
-        });
+        if let Some((cx, cy)) = app.input.cursor_pos_with_state(text_rect, app.input_state) {
+            f.set_cursor_position(Position { x: cx, y: cy });
+        }
     }
 }
 
@@ -236,66 +233,12 @@ pub fn input_text_width(area_width: u16) -> u16 {
         .max(1)
 }
 
-/// Number of visual rows the input text needs at the given inner text width.
-/// Always at least 1 so the input box has a content row even when empty.
-pub fn input_visual_rows(input: &str, text_width: u16) -> u16 {
-    let rows = wrap_input(input, 0, text_width).rows.len();
-    (rows.max(1)).min(u16::MAX as usize) as u16
-}
-
-struct WrapLayout {
-    rows: Vec<String>,
-    cursor_row: u16,
-    cursor_col: u16,
-}
-
-fn wrap_input(input: &str, cursor: usize, text_width: u16) -> WrapLayout {
-    let tw = text_width.max(1) as usize;
-    let mut rows: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut col: usize = 0;
-    let mut cursor_pos: Option<(u16, u16)> = None;
-
-    for (i, c) in input.char_indices() {
-        if i == cursor && cursor_pos.is_none() {
-            if col >= tw {
-                rows.push(std::mem::take(&mut current));
-                col = 0;
-            }
-            cursor_pos = Some((rows.len() as u16, col as u16));
-        }
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
-        if w > 0 && col + w > tw {
-            rows.push(std::mem::take(&mut current));
-            col = 0;
-        }
-        current.push(c);
-        col += w;
-    }
-
-    if cursor_pos.is_none() {
-        if col >= tw {
-            rows.push(std::mem::take(&mut current));
-            cursor_pos = Some((rows.len() as u16, 0));
-        } else {
-            cursor_pos = Some((rows.len() as u16, col as u16));
-        }
-    }
-
-    rows.push(current);
-    let (cursor_row, cursor_col) = cursor_pos.unwrap();
-    WrapLayout {
-        rows,
-        cursor_row,
-        cursor_col,
-    }
-}
-
 fn is_valid_pending_command(app: &App) -> bool {
     !app.streaming
         && matches!(app.mode, ViewMode::Chat)
         && app
             .input
+            .text()
             .strip_prefix('/')
             .is_some_and(|command| parse_slash_command(command).is_ok())
 }

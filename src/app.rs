@@ -6,6 +6,7 @@ use crate::{
     app_event::{AppEvent, AppEventSender},
     commands::{CommandError, SlashCommand, parse_slash_command},
     provider::Provider,
+    textarea::{TextArea, TextAreaState},
     ui,
 };
 
@@ -103,8 +104,8 @@ pub struct LiveCell {
 
 pub struct App {
     pub messages: Vec<Message>,
-    pub input: String,
-    pub cursor: usize,
+    pub input: TextArea,
+    pub input_state: TextAreaState,
     pub streaming: bool,
     pub status: Option<Status>,
     pub spinner_idx: usize,
@@ -130,8 +131,8 @@ impl App {
 
         Self {
             messages,
-            input: String::new(),
-            cursor: 0,
+            input: TextArea::new(),
+            input_state: TextAreaState::default(),
             streaming: false,
             status: Some(Status::info(status)),
             spinner_idx: 0,
@@ -179,97 +180,36 @@ impl App {
     }
 
     fn handle_chat_key(&mut self, key: KeyEvent, tx: &AppEventSender) {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc => tx.send(AppEvent::Quit),
-            KeyCode::Enter if !self.streaming => {
-                let text = self.input.trim().to_string();
-                if text.is_empty() {
-                    return;
-                }
-
-                if let Some(command_text) = text.strip_prefix('/') {
-                    self.clear_input();
-                    self.handle_slash_command(command_text, tx);
-                    return;
-                }
-
-                self.clear_input();
-                tx.send(AppEvent::Submit(text));
+            KeyCode::Enter if !self.streaming && !shift => {
+                self.submit_input(tx);
             }
-            KeyCode::Backspace if !self.streaming => {
-                self.backspace();
-            }
-            KeyCode::Left if !self.streaming => {
-                self.move_left();
-            }
-            KeyCode::Right if !self.streaming => {
-                self.move_right();
-            }
-            KeyCode::Home if !self.streaming => {
-                self.move_home();
-            }
-            KeyCode::End if !self.streaming => {
-                self.move_end();
-            }
-            KeyCode::Char(c) if !self.streaming => {
-                self.insert_char(c);
+            _ if !self.streaming => {
+                self.input.input(key);
             }
             _ => {}
         }
     }
 
+    fn submit_input(&mut self, tx: &AppEventSender) {
+        let text = self.input.text().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(command_text) = text.strip_prefix('/') {
+            self.clear_input();
+            self.handle_slash_command(command_text, tx);
+            return;
+        }
+        self.clear_input();
+        tx.send(AppEvent::Submit(text));
+    }
+
     pub fn clear_input(&mut self) {
         self.input.clear();
-        self.cursor = 0;
-    }
-
-    fn insert_char(&mut self, c: char) {
-        self.input.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let prev = self.input[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        self.input.remove(prev);
-        self.cursor = prev;
-    }
-
-    fn move_left(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        self.cursor = self.input[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-    }
-
-    fn move_right(&mut self) {
-        if self.cursor >= self.input.len() {
-            return;
-        }
-        let advance = self.input[self.cursor..]
-            .chars()
-            .next()
-            .map(|c| c.len_utf8())
-            .unwrap_or(0);
-        self.cursor += advance;
-    }
-
-    fn move_home(&mut self) {
-        self.cursor = 0;
-    }
-
-    fn move_end(&mut self) {
-        self.cursor = self.input.len();
+        self.input_state = TextAreaState::default();
     }
 
     fn handle_slash_command(&mut self, command_text: &str, tx: &AppEventSender) {
@@ -672,6 +612,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::empty())
     }
 
+    fn shift_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
     fn ctrl_key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
@@ -701,7 +645,7 @@ mod tests {
     fn handle_key_submits_trimmed_input() {
         let mut app = app();
         let (tx, mut rx) = channel();
-        app.input = "  hello  ".to_string();
+        app.input.insert_str("  hello  ");
 
         app.handle_key(key(KeyCode::Enter), &tx);
 
@@ -715,19 +659,19 @@ mod tests {
     fn handle_key_ignores_empty_submit() {
         let mut app = app();
         let (tx, mut rx) = channel();
-        app.input = "   ".to_string();
+        app.input.insert_str("   ");
 
         app.handle_key(key(KeyCode::Enter), &tx);
 
         assert!(drain(&mut rx).is_empty());
-        assert_eq!(app.input, "   ");
+        assert_eq!(app.input.text(), "   ");
     }
 
     #[test]
     fn handle_key_routes_exit_command_to_quit() {
         let mut app = app();
         let (tx, mut rx) = channel();
-        app.input = "/quit".to_string();
+        app.input.insert_str("/quit");
 
         app.handle_key(key(KeyCode::Enter), &tx);
 
@@ -740,7 +684,7 @@ mod tests {
     fn handle_key_routes_clear_command_to_clear_event() {
         let mut app = app();
         let (tx, mut rx) = channel();
-        app.input = "/clear".to_string();
+        app.input.insert_str("/clear");
 
         app.handle_key(key(KeyCode::Enter), &tx);
 
@@ -752,7 +696,7 @@ mod tests {
     fn handle_key_opens_model_picker_and_loads_when_empty() {
         let mut app = app();
         let (tx, mut rx) = channel();
-        app.input = "/model".to_string();
+        app.input.insert_str("/model");
 
         app.handle_key(key(KeyCode::Enter), &tx);
 
@@ -767,7 +711,7 @@ mod tests {
         let mut app = app();
         let (tx, mut rx) = channel();
         app.models = vec![model("test-model")];
-        app.input = "/model".to_string();
+        app.input.insert_str("/model");
 
         app.handle_key(key(KeyCode::Enter), &tx);
 
@@ -780,8 +724,8 @@ mod tests {
     fn streaming_blocks_text_editing_and_submit() {
         let mut app = app();
         let (tx, mut rx) = channel();
-        app.input = "hello".to_string();
-        app.cursor = app.input.len();
+        app.input.insert_str("hello");
+        app.input.set_cursor(app.input.text().len());
         app.streaming = true;
 
         app.handle_key(key(KeyCode::Char('!')), &tx);
@@ -790,69 +734,69 @@ mod tests {
         app.handle_key(key(KeyCode::Home), &tx);
 
         assert!(drain(&mut rx).is_empty());
-        assert_eq!(app.input, "hello");
-        assert_eq!(app.cursor, 5);
+        assert_eq!(app.input.text(), "hello");
+        assert_eq!(app.input.cursor(), 5);
     }
 
     #[test]
     fn typing_inserts_chars_at_cursor() {
         let mut app = app();
         let (tx, _rx) = channel();
-        app.input = "hllo".to_string();
-        app.cursor = 1;
+        app.input.insert_str("hllo");
+        app.input.set_cursor(1);
 
         app.handle_key(key(KeyCode::Char('e')), &tx);
 
-        assert_eq!(app.input, "hello");
-        assert_eq!(app.cursor, 2);
+        assert_eq!(app.input.text(), "hello");
+        assert_eq!(app.input.cursor(), 2);
     }
 
     #[test]
     fn backspace_deletes_char_before_cursor() {
         let mut app = app();
         let (tx, _rx) = channel();
-        app.input = "hxello".to_string();
-        app.cursor = 2;
+        app.input.insert_str("hxello");
+        app.input.set_cursor(2);
 
         app.handle_key(key(KeyCode::Backspace), &tx);
 
-        assert_eq!(app.input, "hello");
-        assert_eq!(app.cursor, 1);
+        assert_eq!(app.input.text(), "hello");
+        assert_eq!(app.input.cursor(), 1);
     }
 
     #[test]
     fn backspace_at_start_is_noop() {
         let mut app = app();
         let (tx, _rx) = channel();
-        app.input = "hello".to_string();
-        app.cursor = 0;
+        app.input.insert_str("hello");
+        app.input.set_cursor(0);
 
         app.handle_key(key(KeyCode::Backspace), &tx);
 
-        assert_eq!(app.input, "hello");
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.input.text(), "hello");
+        assert_eq!(app.input.cursor(), 0);
     }
 
     #[test]
     fn arrow_keys_walk_char_boundaries() {
         let mut app = app();
         let (tx, _rx) = channel();
-        app.input = "ab".to_string();
-        app.cursor = 2;
+        app.input.insert_str("ab");
+        app.input.set_cursor(2);
 
         app.handle_key(key(KeyCode::Left), &tx);
-        assert_eq!(app.cursor, 1);
+        assert_eq!(app.input.cursor(), 1);
         app.handle_key(key(KeyCode::Left), &tx);
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.input.cursor(), 0);
         app.handle_key(key(KeyCode::Left), &tx);
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.input.cursor(), 0);
 
         app.handle_key(key(KeyCode::Right), &tx);
-        assert_eq!(app.cursor, 1);
+        assert_eq!(app.input.cursor(), 1);
         app.handle_key(key(KeyCode::Right), &tx);
-        assert_eq!(app.cursor, 2);
+        assert_eq!(app.input.cursor(), 2);
         app.handle_key(key(KeyCode::Right), &tx);
-        assert_eq!(app.cursor, 2);
+        assert_eq!(app.input.cursor(), 2);
     }
 
     #[test]
@@ -860,43 +804,107 @@ mod tests {
         let mut app = app();
         let (tx, _rx) = channel();
         // 'é' is 2 bytes in UTF-8.
-        app.input = "aéb".to_string();
-        app.cursor = 0;
+        app.input.insert_str("aéb");
+        app.input.set_cursor(0);
 
         app.handle_key(key(KeyCode::Right), &tx);
-        assert_eq!(app.cursor, 1);
+        assert_eq!(app.input.cursor(), 1);
         app.handle_key(key(KeyCode::Right), &tx);
-        assert_eq!(app.cursor, 3);
+        assert_eq!(app.input.cursor(), 3);
         app.handle_key(key(KeyCode::Left), &tx);
-        assert_eq!(app.cursor, 1);
+        assert_eq!(app.input.cursor(), 1);
     }
 
     #[test]
     fn home_and_end_jump_to_edges() {
         let mut app = app();
         let (tx, _rx) = channel();
-        app.input = "hello".to_string();
-        app.cursor = 2;
+        app.input.insert_str("hello");
+        app.input.set_cursor(2);
 
         app.handle_key(key(KeyCode::Home), &tx);
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.input.cursor(), 0);
         app.handle_key(key(KeyCode::End), &tx);
-        assert_eq!(app.cursor, 5);
+        assert_eq!(app.input.cursor(), 5);
     }
 
     #[test]
     fn submit_resets_cursor_to_zero() {
         let mut app = app();
         let (tx, mut rx) = channel();
-        app.input = "hi".to_string();
-        app.cursor = 2;
+        app.input.insert_str("hi");
+        app.input.set_cursor(2);
 
         app.handle_key(key(KeyCode::Enter), &tx);
 
         let events = drain(&mut rx);
         assert!(matches!(&events[0], AppEvent::Submit(t) if t == "hi"));
-        assert_eq!(app.cursor, 0);
+        assert_eq!(app.input.cursor(), 0);
         assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_without_submitting() {
+        let mut app = app();
+        let (tx, mut rx) = channel();
+        app.input.insert_str("hello");
+        app.input.set_cursor(app.input.text().len());
+
+        app.handle_key(shift_key(KeyCode::Enter), &tx);
+        app.handle_key(key(KeyCode::Char('w')), &tx);
+
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(app.input.text(), "hello\nw");
+    }
+
+    #[test]
+    fn plain_enter_submits_multiline_text_intact() {
+        let mut app = app();
+        let (tx, mut rx) = channel();
+        app.input.insert_str("foo");
+        app.input.set_cursor(app.input.text().len());
+        app.handle_key(shift_key(KeyCode::Enter), &tx);
+        app.handle_key(key(KeyCode::Char('b')), &tx);
+        app.handle_key(key(KeyCode::Char('a')), &tx);
+        app.handle_key(key(KeyCode::Char('r')), &tx);
+
+        app.handle_key(key(KeyCode::Enter), &tx);
+
+        let events = drain(&mut rx);
+        assert!(matches!(&events[0], AppEvent::Submit(t) if t == "foo\nbar"));
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn up_arrow_moves_cursor_across_explicit_newline() {
+        let mut app = app();
+        let (tx, _rx) = channel();
+        app.input.insert_str("foo");
+        app.input.set_cursor(app.input.text().len());
+        app.handle_key(shift_key(KeyCode::Enter), &tx);
+        app.handle_key(key(KeyCode::Char('b')), &tx);
+        app.handle_key(key(KeyCode::Char('a')), &tx);
+        app.handle_key(key(KeyCode::Char('r')), &tx);
+        // cursor is at end of "foo\nbar" (position 7)
+        assert_eq!(app.input.cursor(), 7);
+
+        app.handle_key(key(KeyCode::Up), &tx);
+        // Should land at end of "foo" (position 3) — same display column as "bar".
+        assert_eq!(app.input.cursor(), 3);
+    }
+
+    #[test]
+    fn streaming_blocks_shift_enter_newline() {
+        let mut app = app();
+        let (tx, mut rx) = channel();
+        app.input.insert_str("hello");
+        app.input.set_cursor(app.input.text().len());
+        app.streaming = true;
+
+        app.handle_key(shift_key(KeyCode::Enter), &tx);
+
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(app.input.text(), "hello");
     }
 
     #[test]
@@ -915,7 +923,7 @@ mod tests {
     fn auth_slash_command_opens_wizard() {
         let mut app = app();
         let (tx, _rx) = channel();
-        app.input = "/auth".to_string();
+        app.input.insert_str("/auth");
 
         app.handle_key(key(KeyCode::Enter), &tx);
 
@@ -1110,7 +1118,7 @@ mod tests {
         let mut app = app();
         let (tx, mut rx) = channel();
         app.set_models(vec![model("alpha"), model("beta"), model("gamma")]);
-        app.input = "/model".to_string();
+        app.input.insert_str("/model");
         app.handle_key(key(KeyCode::Enter), &tx);
         drain(&mut rx);
 
@@ -1150,7 +1158,7 @@ mod tests {
             role: "user".to_string(),
             content: "hello".to_string(),
         });
-        app.input = "draft".to_string();
+        app.input.insert_str("draft");
         app.streaming = true;
         app.mode = ViewMode::ModelPicker;
         app.model_picker.loading = true;
@@ -1159,7 +1167,7 @@ mod tests {
         app.clear_for_new_session("new-session");
 
         assert!(app.messages.is_empty());
-        assert!(app.input.is_empty());
+        assert!(app.input.text().is_empty());
         assert!(!app.streaming);
         assert!(matches!(app.mode, ViewMode::Chat));
         assert!(!app.model_picker.loading);

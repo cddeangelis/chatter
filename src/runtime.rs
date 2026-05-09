@@ -74,7 +74,7 @@ pub async fn run(
     let mut persist_gate = PersistGate::new();
     terminal::with_sync_update(|| {
         reshape_for_input(terminal, &app)?;
-        terminal.draw(|f| ui::render(&app, f))?;
+        terminal.draw(|f| ui::render(&mut app, f))?;
         Ok(())
     })?;
 
@@ -148,7 +148,7 @@ pub async fn run(
             if elapsed >= MIN_FRAME {
                 terminal::with_sync_update(|| {
                     reshape_for_input(terminal, &app)?;
-                    terminal.draw(|f| ui::render(&app, f))?;
+                    terminal.draw(|f| ui::render(&mut app, f))?;
                     Ok(())
                 })?;
                 last_draw = Instant::now();
@@ -358,7 +358,7 @@ fn reshape_for_input(terminal: &mut crate::terminal::Tui, app: &App) -> Result<(
     }
     let screen = terminal.size()?;
     let text_width = ui::input_text_width(screen.width);
-    let input_rows = ui::input_visual_rows(&app.input, text_width);
+    let input_rows = app.input.desired_height(text_width);
     let desired = input_rows.saturating_add(ui::INPUT_CHROME_ROWS);
     terminal::reshape_viewport(terminal, desired)
 }

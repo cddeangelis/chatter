@@ -18,6 +18,46 @@ use ratatui::text::Span;
 use std::ops::Range;
 use textwrap::Options;
 
+/// Returns byte-ranges into `text` for each wrapped line. Each range covers
+/// the visible content plus any trailing space run plus a 1-byte sentinel
+/// past the run. The sentinel lets the textarea distinguish cursor-at-end-of-
+/// line from cursor-at-start-of-next-line when computing render positions.
+pub fn wrap_ranges<'a, O>(text: &str, width_or_options: O) -> Vec<Range<usize>>
+where
+    O: Into<Options<'a>>,
+{
+    let opts = width_or_options.into();
+    let mut lines: Vec<Range<usize>> = Vec::new();
+    let mut cursor = 0usize;
+    for (line_index, line) in textwrap::wrap(text, &opts).iter().enumerate() {
+        match line {
+            std::borrow::Cow::Borrowed(slice) => {
+                // SAFETY: `textwrap::wrap` returns `Cow::Borrowed` only when the slice
+                // is a subslice of `text`, so `slice.as_ptr()` is in-bounds of
+                // `text.as_ptr()` and `offset_from` is well-defined and non-negative.
+                let start = unsafe { slice.as_ptr().offset_from(text.as_ptr()) as usize };
+                let end = start + slice.len();
+                let trailing_spaces = text[end..].chars().take_while(|c| *c == ' ').count();
+                lines.push(start..end + trailing_spaces + 1);
+                cursor = end + trailing_spaces;
+            }
+            std::borrow::Cow::Owned(slice) => {
+                let synthetic_prefix = if line_index == 0 {
+                    opts.initial_indent
+                } else {
+                    opts.subsequent_indent
+                };
+                let mapped = map_owned_wrapped_line_to_range(text, cursor, slice, synthetic_prefix);
+                let trailing_spaces =
+                    text[mapped.end..].chars().take_while(|c| *c == ' ').count();
+                lines.push(mapped.start..mapped.end + trailing_spaces + 1);
+                cursor = mapped.end + trailing_spaces;
+            }
+        }
+    }
+    lines
+}
+
 /// Returns byte-ranges into `text` for each wrapped line, without trailing
 /// whitespace and without a sentinel byte.
 fn wrap_ranges_trim<'a, O>(text: &str, width_or_options: O) -> Vec<Range<usize>>
@@ -30,6 +70,7 @@ where
     for (line_index, line) in textwrap::wrap(text, &opts).iter().enumerate() {
         match line {
             std::borrow::Cow::Borrowed(slice) => {
+                // SAFETY: see `wrap_ranges` — borrowed slices are subslices of `text`.
                 let start = unsafe { slice.as_ptr().offset_from(text.as_ptr()) as usize };
                 let end = start + slice.len();
                 lines.push(start..end);

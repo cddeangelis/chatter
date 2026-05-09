@@ -11,6 +11,7 @@ pub mod runtime;
 pub mod session;
 pub mod state;
 pub mod terminal;
+pub mod textarea;
 pub mod ui;
 pub mod user_config;
 pub mod wrapping;
