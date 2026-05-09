@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::{
     logger,
     provider::Provider,
-    user_config::{self, UserConfig},
+    user_config::UserConfig,
 };
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You and the user are having a conversation. This is not a user-assistant interaction, simply a conversation between two minds.";
@@ -24,16 +24,6 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let config_dir = user_config::config_dir()?;
-        if !config_dir.join("config.toml").exists()
-            && config_dir.join("config.json").exists()
-        {
-            logger::warn(format_args!(
-                "found stale {} — create config.toml to configure chatter",
-                config_dir.join("config.json").display()
-            ));
-        }
-
         let user_cfg = UserConfig::load()?;
 
         let profile_name = std::env::var("CHATTER_PROFILE")
@@ -121,7 +111,7 @@ impl Config {
 
 /// Accepts `scheme://host` or `scheme://host:port`. Rejects URLs with a path component.
 /// Strips a trailing slash for convenience.
-fn validate_origin(origin: &str) -> Result<String> {
+pub(crate) fn validate_origin(origin: &str) -> Result<String> {
     let origin = origin.trim_end_matches('/');
     let host_start = origin.find("://").map(|i| i + 3).unwrap_or(0);
     if origin[host_start..].contains('/') {

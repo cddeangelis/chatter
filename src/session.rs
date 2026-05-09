@@ -15,6 +15,12 @@ pub enum SessionCommand {
     Resume(String),
 }
 
+#[derive(Clone, Debug)]
+pub enum StartupCommand {
+    Chat(SessionCommand),
+    Auth,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionState {
     pub id: String,
@@ -87,18 +93,19 @@ impl SessionStore {
     }
 }
 
-pub fn parse_args<I>(args: I) -> Result<SessionCommand>
+pub fn parse_args<I>(args: I) -> Result<StartupCommand>
 where
     I: IntoIterator<Item = String>,
 {
     let args = args.into_iter().skip(1).collect::<Vec<_>>();
     match args.as_slice() {
-        [] => Ok(SessionCommand::New),
+        [] => Ok(StartupCommand::Chat(SessionCommand::New)),
+        [cmd] if cmd == "auth" => Ok(StartupCommand::Auth),
         [cmd, id] if cmd == "resume" => {
             validate_uuid(id)?;
-            Ok(SessionCommand::Resume(id.clone()))
+            Ok(StartupCommand::Chat(SessionCommand::Resume(id.clone())))
         }
-        _ => Err(anyhow!("usage: chatter [resume <session-uuid>]")),
+        _ => Err(anyhow!("usage: chatter [resume <session-uuid> | auth]")),
     }
 }
 
@@ -164,15 +171,23 @@ mod tests {
     fn parse_args_defaults_to_new_session() {
         assert!(matches!(
             parse_args(args(&["chatter"])).unwrap(),
-            SessionCommand::New
+            StartupCommand::Chat(SessionCommand::New)
+        ));
+    }
+
+    #[test]
+    fn parse_args_accepts_auth_subcommand() {
+        assert!(matches!(
+            parse_args(args(&["chatter", "auth"])).unwrap(),
+            StartupCommand::Auth
         ));
     }
 
     #[test]
     fn parse_args_accepts_valid_resume_id() {
         match parse_args(args(&["chatter", "resume", ID])).unwrap() {
-            SessionCommand::Resume(id) => assert_eq!(id, ID),
-            SessionCommand::New => panic!("expected resume command"),
+            StartupCommand::Chat(SessionCommand::Resume(id)) => assert_eq!(id, ID),
+            other => panic!("expected Chat(Resume(id)), got {other:?}"),
         }
     }
 
@@ -181,6 +196,7 @@ mod tests {
         assert!(parse_args(args(&["chatter", "resume", "bad"])).is_err());
         assert!(parse_args(args(&["chatter", "resume"])).is_err());
         assert!(parse_args(args(&["chatter", "new"])).is_err());
+        assert!(parse_args(args(&["chatter", "auth", "extra"])).is_err());
     }
 
     #[test]

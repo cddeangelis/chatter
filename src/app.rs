@@ -5,12 +5,76 @@ use crate::{
     api::{Message, ModelInfo},
     app_event::{AppEvent, AppEventSender},
     commands::{CommandError, SlashCommand, parse_slash_command},
+    provider::Provider,
     ui,
 };
 
 pub enum ViewMode {
     Chat,
     ModelPicker,
+    AuthWizard,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AuthProviderChoice {
+    Anthropic,
+    OpenRouter,
+    Custom,
+}
+
+impl AuthProviderChoice {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Anthropic  => "Anthropic",
+            Self::OpenRouter => "OpenRouter",
+            Self::Custom     => "Custom (OpenAI-compatible)",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Anthropic  => "Claude models via the Anthropic API",
+            Self::OpenRouter => "200+ models via OpenRouter",
+            Self::Custom     => "Any OpenAI-compatible endpoint (Together, Groq, llama.cpp, …)",
+        }
+    }
+}
+
+pub const AUTH_PROVIDER_CHOICES: &[AuthProviderChoice] = &[
+    AuthProviderChoice::Anthropic,
+    AuthProviderChoice::OpenRouter,
+    AuthProviderChoice::Custom,
+];
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum AuthStep {
+    SelectProvider,
+    EnterOrigin,
+    EnterApiKey,
+}
+
+pub struct AuthWizard {
+    pub step: AuthStep,
+    pub provider_idx: usize,
+    pub origin: String,
+    pub origin_cursor: usize,
+    pub api_key: String,
+    pub api_key_cursor: usize,
+    pub error: Option<String>,
+}
+
+impl Default for AuthWizard {
+    fn default() -> Self {
+        Self {
+            step: AuthStep::SelectProvider,
+            provider_idx: 0,
+            origin: String::new(),
+            origin_cursor: 0,
+            api_key: String::new(),
+            api_key_cursor: 0,
+            error: None,
+        }
+    }
 }
 
 pub struct ModelPicker {
@@ -48,6 +112,7 @@ pub struct App {
     pub models: Vec<ModelInfo>,
     pub mode: ViewMode,
     pub model_picker: ModelPicker,
+    pub auth_wizard: AuthWizard,
     pub live: Option<LiveCell>,
     pub dirty: bool,
 }
@@ -79,6 +144,7 @@ impl App {
                 loading: false,
                 error: None,
             },
+            auth_wizard: AuthWizard::default(),
             live: None,
             dirty: true,
         }
@@ -108,6 +174,7 @@ impl App {
         match self.mode {
             ViewMode::Chat => self.handle_chat_key(key, tx),
             ViewMode::ModelPicker => self.handle_model_picker_key(key, tx),
+            ViewMode::AuthWizard => self.handle_auth_wizard_key(key, tx),
         }
     }
 
@@ -207,6 +274,7 @@ impl App {
 
     fn handle_slash_command(&mut self, command_text: &str, tx: &AppEventSender) {
         match parse_slash_command(command_text) {
+            Ok(SlashCommand::Auth) => self.open_auth_wizard(),
             Ok(SlashCommand::Clear) => tx.send(AppEvent::Clear),
             Ok(SlashCommand::Exit) => tx.send(AppEvent::Quit),
             Ok(SlashCommand::Model) => {
@@ -220,7 +288,7 @@ impl App {
                 self.status = Some(Status::info(format!("unknown command: /{name}")));
             }
             Err(CommandError::Empty) => {
-                self.status = Some(Status::info("type /exit or /model"));
+                self.status = Some(Status::info("type /auth, /clear, /exit, or /model"));
             }
         }
     }
@@ -378,6 +446,159 @@ impl App {
         self.mode = ViewMode::Chat;
         self.model_picker.loading = false;
         self.model_picker.error = None;
+    }
+
+    pub fn open_auth_wizard(&mut self) {
+        self.auth_wizard = AuthWizard::default();
+        self.mode = ViewMode::AuthWizard;
+    }
+
+    fn close_auth_wizard(&mut self) {
+        self.mode = ViewMode::Chat;
+    }
+
+    fn handle_auth_wizard_key(&mut self, key: KeyEvent, tx: &AppEventSender) {
+        match self.auth_wizard.step {
+            AuthStep::SelectProvider => self.handle_auth_select_provider(key),
+            AuthStep::EnterOrigin    => self.handle_auth_enter_origin(key),
+            AuthStep::EnterApiKey    => self.handle_auth_enter_api_key(key, tx),
+        }
+    }
+
+    fn handle_auth_select_provider(&mut self, key: KeyEvent) {
+        let max = AUTH_PROVIDER_CHOICES.len() - 1;
+        match key.code {
+            KeyCode::Esc => self.close_auth_wizard(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.auth_wizard.provider_idx =
+                    self.auth_wizard.provider_idx.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.auth_wizard.provider_idx =
+                    (self.auth_wizard.provider_idx + 1).min(max);
+            }
+            KeyCode::Home => self.auth_wizard.provider_idx = 0,
+            KeyCode::End  => self.auth_wizard.provider_idx = max,
+            KeyCode::Enter => {
+                self.auth_wizard.error = None;
+                let choice = AUTH_PROVIDER_CHOICES[self.auth_wizard.provider_idx];
+                self.auth_wizard.step = match choice {
+                    AuthProviderChoice::Custom => AuthStep::EnterOrigin,
+                    _                          => AuthStep::EnterApiKey,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_auth_enter_origin(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.close_auth_wizard(),
+            KeyCode::Enter => {
+                match crate::config::validate_origin(&self.auth_wizard.origin) {
+                    Ok(normalized) => {
+                        self.auth_wizard.origin = normalized;
+                        self.auth_wizard.origin_cursor = self.auth_wizard.origin.len();
+                        self.auth_wizard.error = None;
+                        self.auth_wizard.step = AuthStep::EnterApiKey;
+                    }
+                    Err(e) => {
+                        self.auth_wizard.error = Some(e.to_string());
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                let cursor = self.auth_wizard.origin_cursor;
+                if cursor == 0 { return; }
+                let prev = self.auth_wizard.origin[..cursor]
+                    .char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                self.auth_wizard.origin.remove(prev);
+                self.auth_wizard.origin_cursor = prev;
+            }
+            KeyCode::Left => {
+                let cursor = self.auth_wizard.origin_cursor;
+                if cursor > 0 {
+                    self.auth_wizard.origin_cursor = self.auth_wizard.origin[..cursor]
+                        .char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                }
+            }
+            KeyCode::Right => {
+                let cursor = self.auth_wizard.origin_cursor;
+                if cursor < self.auth_wizard.origin.len() {
+                    self.auth_wizard.origin_cursor += self.auth_wizard.origin[cursor..]
+                        .chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+                }
+            }
+            KeyCode::Home => self.auth_wizard.origin_cursor = 0,
+            KeyCode::End  => self.auth_wizard.origin_cursor = self.auth_wizard.origin.len(),
+            KeyCode::Char(c) => {
+                self.auth_wizard.error = None;
+                self.auth_wizard.origin.insert(self.auth_wizard.origin_cursor, c);
+                self.auth_wizard.origin_cursor += c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_auth_enter_api_key(&mut self, key: KeyEvent, tx: &AppEventSender) {
+        match key.code {
+            KeyCode::Esc => self.close_auth_wizard(),
+            KeyCode::Enter => {
+                if self.auth_wizard.api_key.is_empty() {
+                    return;
+                }
+                let choice = AUTH_PROVIDER_CHOICES[self.auth_wizard.provider_idx];
+                let provider = match choice {
+                    AuthProviderChoice::Anthropic              => Provider::Anthropic,
+                    AuthProviderChoice::OpenRouter |
+                    AuthProviderChoice::Custom     => Provider::OpenRouter,
+                };
+                let origin = if choice == AuthProviderChoice::Custom {
+                    Some(self.auth_wizard.origin.clone())
+                } else {
+                    None
+                };
+                tx.send(AppEvent::AuthSubmit {
+                    provider,
+                    origin,
+                    api_key: self.auth_wizard.api_key.clone(),
+                });
+                self.close_auth_wizard();
+            }
+            KeyCode::Backspace => {
+                let cursor = self.auth_wizard.api_key_cursor;
+                if cursor == 0 { return; }
+                let prev = self.auth_wizard.api_key[..cursor]
+                    .char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                self.auth_wizard.api_key.remove(prev);
+                self.auth_wizard.api_key_cursor = prev;
+            }
+            KeyCode::Left => {
+                let cursor = self.auth_wizard.api_key_cursor;
+                if cursor > 0 {
+                    self.auth_wizard.api_key_cursor = self.auth_wizard.api_key[..cursor]
+                        .char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                }
+            }
+            KeyCode::Right => {
+                let cursor = self.auth_wizard.api_key_cursor;
+                if cursor < self.auth_wizard.api_key.len() {
+                    self.auth_wizard.api_key_cursor += self.auth_wizard.api_key[cursor..]
+                        .chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+                }
+            }
+            KeyCode::Home => self.auth_wizard.api_key_cursor = 0,
+            KeyCode::End  => self.auth_wizard.api_key_cursor = self.auth_wizard.api_key.len(),
+            KeyCode::Char(c) => {
+                self.auth_wizard.api_key.insert(self.auth_wizard.api_key_cursor, c);
+                self.auth_wizard.api_key_cursor += c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    pub fn set_status_info(&mut self, msg: String) {
+        self.status = Some(Status::info(msg));
     }
 
     fn set_current_model(&mut self, model: String) {
@@ -688,6 +909,139 @@ mod tests {
 
         let events = drain(&mut rx);
         assert!(matches!(events.as_slice(), [AppEvent::Quit]));
+    }
+
+    #[test]
+    fn auth_slash_command_opens_wizard() {
+        let mut app = app();
+        let (tx, _rx) = channel();
+        app.input = "/auth".to_string();
+
+        app.handle_key(key(KeyCode::Enter), &tx);
+
+        assert!(matches!(app.mode, ViewMode::AuthWizard));
+        assert!(matches!(app.auth_wizard.step, AuthStep::SelectProvider));
+    }
+
+    #[test]
+    fn auth_wizard_provider_selection_bounded() {
+        let mut app = app();
+        let (tx, _rx) = channel();
+        app.open_auth_wizard();
+
+        app.handle_key(key(KeyCode::Down), &tx);
+        assert_eq!(app.auth_wizard.provider_idx, 1);
+        app.handle_key(key(KeyCode::Down), &tx);
+        assert_eq!(app.auth_wizard.provider_idx, 2);
+        app.handle_key(key(KeyCode::Down), &tx);
+        assert_eq!(app.auth_wizard.provider_idx, 2, "should be bounded");
+        app.handle_key(key(KeyCode::Home), &tx);
+        assert_eq!(app.auth_wizard.provider_idx, 0);
+        app.handle_key(key(KeyCode::End), &tx);
+        assert_eq!(app.auth_wizard.provider_idx, 2);
+    }
+
+    #[test]
+    fn auth_wizard_anthropic_skips_origin_step() {
+        let mut app = app();
+        let (tx, _rx) = channel();
+        app.open_auth_wizard();
+        // provider_idx 0 = Anthropic
+        app.handle_key(key(KeyCode::Enter), &tx);
+
+        assert!(matches!(app.auth_wizard.step, AuthStep::EnterApiKey));
+    }
+
+    #[test]
+    fn auth_wizard_custom_goes_through_origin_step() {
+        let mut app = app();
+        let (tx, _rx) = channel();
+        app.open_auth_wizard();
+        // Navigate to Custom (idx 2)
+        app.handle_key(key(KeyCode::End), &tx);
+        app.handle_key(key(KeyCode::Enter), &tx);
+
+        assert!(matches!(app.auth_wizard.step, AuthStep::EnterOrigin));
+
+        // Type a valid origin
+        for c in "https://api.together.ai".chars() {
+            app.handle_key(key(KeyCode::Char(c)), &tx);
+        }
+        app.handle_key(key(KeyCode::Enter), &tx);
+
+        assert!(matches!(app.auth_wizard.step, AuthStep::EnterApiKey));
+        assert!(app.auth_wizard.error.is_none());
+    }
+
+    #[test]
+    fn auth_wizard_origin_invalid_shows_error() {
+        let mut app = app();
+        let (tx, _rx) = channel();
+        app.open_auth_wizard();
+        app.handle_key(key(KeyCode::End), &tx);
+        app.handle_key(key(KeyCode::Enter), &tx);
+
+        // Type an origin with a path (invalid)
+        for c in "https://example.com/v1".chars() {
+            app.handle_key(key(KeyCode::Char(c)), &tx);
+        }
+        app.handle_key(key(KeyCode::Enter), &tx);
+
+        assert!(matches!(app.auth_wizard.step, AuthStep::EnterOrigin));
+        assert!(app.auth_wizard.error.is_some());
+    }
+
+    #[test]
+    fn auth_wizard_empty_key_does_not_submit() {
+        let mut app = app();
+        let (tx, mut rx) = channel();
+        app.open_auth_wizard();
+        app.handle_key(key(KeyCode::Enter), &tx); // advance to EnterApiKey
+        drain(&mut rx);
+
+        app.handle_key(key(KeyCode::Enter), &tx); // try to submit with empty key
+
+        assert!(drain(&mut rx).is_empty());
+        assert!(matches!(app.mode, ViewMode::AuthWizard));
+    }
+
+    #[test]
+    fn auth_wizard_submit_emits_event_and_closes() {
+        let mut app = app();
+        let (tx, mut rx) = channel();
+        app.open_auth_wizard();
+        // Anthropic, advance to key field
+        app.handle_key(key(KeyCode::Enter), &tx);
+        drain(&mut rx);
+
+        for c in "sk-ant-abc123".chars() {
+            app.handle_key(key(KeyCode::Char(c)), &tx);
+        }
+        app.handle_key(key(KeyCode::Enter), &tx);
+
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AppEvent::AuthSubmit { provider, origin, api_key } => {
+                assert!(matches!(provider, crate::provider::Provider::Anthropic));
+                assert!(origin.is_none());
+                assert_eq!(api_key, "sk-ant-abc123");
+            }
+            other => panic!("expected AuthSubmit, got {other:?}"),
+        }
+        assert!(matches!(app.mode, ViewMode::Chat));
+    }
+
+    #[test]
+    fn auth_wizard_esc_cancels_without_event() {
+        let mut app = app();
+        let (tx, mut rx) = channel();
+        app.open_auth_wizard();
+
+        app.handle_key(key(KeyCode::Esc), &tx);
+
+        assert!(drain(&mut rx).is_empty());
+        assert!(matches!(app.mode, ViewMode::Chat));
     }
 
     #[test]

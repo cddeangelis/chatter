@@ -88,6 +88,35 @@ impl UserConfig {
     }
 }
 
+/// Inserts or updates a named profile with the given credentials, then sets it as active.
+/// Existing profile fields not supplied by the wizard (e.g. system_prompt, max_tokens) are
+/// preserved when the profile already exists.
+pub fn upsert_auth_profile(
+    name: &str,
+    provider: crate::provider::Provider,
+    api_key: String,
+    origin: Option<String>,
+) -> Result<()> {
+    let p = path()?;
+    let mut cfg = UserConfig::load_from(&p)?;
+    let profile = cfg.profile.entry(name.to_string()).or_insert_with(|| Profile {
+        provider,
+        api_key: None,
+        origin: None,
+        model: None,
+        system_prompt: None,
+        max_tokens: None,
+        custom_headers: BTreeMap::new(),
+    });
+    profile.provider = provider;
+    profile.api_key = Some(api_key);
+    if let Some(o) = origin {
+        profile.origin = Some(o);
+    }
+    cfg.active = Some(name.to_string());
+    cfg.save_to(&p)
+}
+
 /// Loads config, updates the active profile's model, and saves. If there is no
 /// active profile the selection is applied in-memory only for this session.
 pub fn persist_active_model(model: &str) -> Result<()> {
@@ -264,6 +293,93 @@ mod tests {
     }
 
     // config_dir tests (moved from session.rs)
+
+    #[test]
+    fn upsert_auth_profile_creates_profile_and_sets_active() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir();
+        let prev = std::env::var_os("CHATTER_CONFIG_DIR");
+        unsafe { std::env::set_var("CHATTER_CONFIG_DIR", &dir) };
+
+        upsert_auth_profile("anthropic", Provider::Anthropic, "sk-ant-test".to_string(), None)
+            .unwrap();
+
+        let loaded = UserConfig::load_from(&dir.join("config.toml")).unwrap();
+        assert_eq!(loaded.active.as_deref(), Some("anthropic"));
+        assert_eq!(
+            loaded.profile["anthropic"].api_key.as_deref(),
+            Some("sk-ant-test")
+        );
+        assert!(loaded.profile["anthropic"].origin.is_none());
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CHATTER_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("CHATTER_CONFIG_DIR") },
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_auth_profile_preserves_existing_fields() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir();
+        let prev = std::env::var_os("CHATTER_CONFIG_DIR");
+        unsafe { std::env::set_var("CHATTER_CONFIG_DIR", &dir) };
+
+        // Write an existing profile with extra fields
+        let mut profile = minimal_profile();
+        profile.system_prompt = Some("be terse".to_string());
+        profile.max_tokens = Some(1024);
+        let cfg = with_profile("anthropic", profile);
+        cfg.save_to(&dir.join("config.toml")).unwrap();
+
+        // Now upsert to update only the api_key
+        upsert_auth_profile("anthropic", Provider::Anthropic, "new-key".to_string(), None)
+            .unwrap();
+
+        let loaded = UserConfig::load_from(&dir.join("config.toml")).unwrap();
+        assert_eq!(loaded.profile["anthropic"].api_key.as_deref(), Some("new-key"));
+        assert_eq!(
+            loaded.profile["anthropic"].system_prompt.as_deref(),
+            Some("be terse")
+        );
+        assert_eq!(loaded.profile["anthropic"].max_tokens, Some(1024));
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CHATTER_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("CHATTER_CONFIG_DIR") },
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_auth_profile_sets_origin_when_supplied() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = temp_dir();
+        let prev = std::env::var_os("CHATTER_CONFIG_DIR");
+        unsafe { std::env::set_var("CHATTER_CONFIG_DIR", &dir) };
+
+        upsert_auth_profile(
+            "custom",
+            Provider::OpenRouter,
+            "sk-test".to_string(),
+            Some("https://api.together.ai".to_string()),
+        )
+        .unwrap();
+
+        let loaded = UserConfig::load_from(&dir.join("config.toml")).unwrap();
+        assert_eq!(loaded.active.as_deref(), Some("custom"));
+        assert_eq!(
+            loaded.profile["custom"].origin.as_deref(),
+            Some("https://api.together.ai")
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CHATTER_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("CHATTER_CONFIG_DIR") },
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn config_dir_uses_env_override_when_set() {

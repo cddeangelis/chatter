@@ -12,11 +12,18 @@ use crate::{
     app_event::{AppEvent, AppEventSender},
     config::Config,
     logger,
+    provider::Provider,
     session::{self, SessionState, SessionStore},
+    state,
     terminal::{self, Tui},
     ui,
     user_config,
 };
+
+pub enum InitialView {
+    Chat,
+    AuthWizard,
+}
 
 pub async fn run(
     terminal: &mut Tui,
@@ -24,6 +31,7 @@ pub async fn run(
     mut config: Config,
     mut session_state: SessionState,
     session_store: SessionStore,
+    initial_view: InitialView,
 ) -> Result<String> {
     config.model = session_state.model.clone();
     logger::info(format_args!(
@@ -36,6 +44,9 @@ pub async fn run(
         session_state.messages.clone(),
         Some(&session_state.id),
     );
+    if matches!(initial_view, InitialView::AuthWizard) {
+        app.open_auth_wizard();
+    }
     let mut events = EventStream::new();
     let mut tick = interval(Duration::from_millis(80));
     let (tx, mut rx) = crate::app_event::channel();
@@ -54,8 +65,12 @@ pub async fn run(
         replay_history(terminal, &app)?;
     }
 
-    let mut alt_saved: Option<Rect> = None;
     let mut prev_picker_open = is_picker_open(&app);
+    let mut alt_saved: Option<Rect> = if prev_picker_open {
+        Some(terminal::enter_fullscreen(terminal)?)
+    } else {
+        None
+    };
     let mut persist_gate = PersistGate::new();
     terminal::with_sync_update(|| {
         reshape_for_input(terminal, &app)?;
@@ -260,6 +275,39 @@ fn handle_app_event(
             logger::error(format_args!("model load error: {e}"));
             app.set_model_load_error(e);
         }
+        AppEvent::AuthSubmit { provider, origin, api_key } => {
+            let profile_name = match (provider, origin.as_ref()) {
+                (Provider::Anthropic, _)     => "anthropic",
+                (Provider::OpenRouter, None) => "openrouter",
+                (Provider::OpenRouter, _)    => "custom",
+            };
+            match user_config::upsert_auth_profile(profile_name, provider, api_key, origin) {
+                Ok(()) => {
+                    if let Err(e) = state::mark_auth_completed() {
+                        logger::warn(format_args!("state save error: {e:#}"));
+                    }
+                    match Config::from_env() {
+                        Ok(new_config) => {
+                            *config = new_config;
+                            app.current_model = config.model.clone();
+                            app.models.clear();
+                            let msg = format!(
+                                "auth saved · profile={profile_name} · model: {}",
+                                config.model
+                            );
+                            app.set_status_info(msg.clone());
+                            push_lines(terminal, ui::render_session_banner(&msg))?;
+                        }
+                        Err(e) => {
+                            app.set_error(format!("config reload failed: {e:#}"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    app.set_error(format!("auth save failed: {e:#}"));
+                }
+            }
+        }
         AppEvent::Resize => {}
     }
     Ok(true)
@@ -301,11 +349,11 @@ fn replay_history(terminal: &mut Tui, app: &App) -> Result<()> {
 }
 
 fn is_picker_open(app: &App) -> bool {
-    matches!(app.mode, ViewMode::ModelPicker)
+    matches!(app.mode, ViewMode::ModelPicker | ViewMode::AuthWizard)
 }
 
 fn reshape_for_input(terminal: &mut crate::terminal::Tui, app: &App) -> Result<()> {
-    if matches!(app.mode, ViewMode::ModelPicker) {
+    if matches!(app.mode, ViewMode::ModelPicker | ViewMode::AuthWizard) {
         return Ok(());
     }
     let screen = terminal.size()?;

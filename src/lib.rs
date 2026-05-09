@@ -9,6 +9,7 @@ pub mod insert_history;
 pub mod logger;
 pub mod runtime;
 pub mod session;
+pub mod state;
 pub mod terminal;
 pub mod ui;
 pub mod user_config;

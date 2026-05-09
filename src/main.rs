@@ -1,13 +1,37 @@
 use anyhow::Result;
 
-use chatter::{api, config::Config, logger, runtime, session, terminal};
+use chatter::{
+    api,
+    config::Config,
+    logger,
+    runtime::{self, InitialView},
+    session::{self, SessionCommand, StartupCommand},
+    state::AppState,
+    terminal,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let session_command = session::parse_args(std::env::args())?;
+    let startup = session::parse_args(std::env::args())?;
     let log_path = session::startup_log_path()?;
     logger::init(&log_path)?;
     logger::info(format_args!("chatter starting log={log_path}"));
+
+    let app_state = AppState::load().unwrap_or_else(|e| {
+        logger::warn(format_args!("state load failed: {e:#}"));
+        AppState::default()
+    });
+
+    let initial_view = match &startup {
+        StartupCommand::Auth => InitialView::AuthWizard,
+        StartupCommand::Chat(_) if !app_state.auth_completed => InitialView::AuthWizard,
+        StartupCommand::Chat(_) => InitialView::Chat,
+    };
+
+    let session_command = match startup {
+        StartupCommand::Auth    => SessionCommand::New,
+        StartupCommand::Chat(c) => c,
+    };
 
     let config = Config::from_env()?;
     let session_store = session::SessionStore::default()?;
@@ -23,6 +47,7 @@ async fn main() -> Result<()> {
         config,
         session_state,
         session_store,
+        initial_view,
     )
     .await;
     terminal::restore(&mut terminal);

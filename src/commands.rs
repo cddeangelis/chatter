@@ -1,4 +1,5 @@
 pub enum SlashCommand {
+    Auth,
     Clear,
     Exit,
     Model,
@@ -16,6 +17,7 @@ pub fn parse_slash_command(input: &str) -> Result<SlashCommand, CommandError> {
     }
 
     match name {
+        "auth" => Ok(SlashCommand::Auth),
         "clear" => Ok(SlashCommand::Clear),
         "exit" | "quit" => Ok(SlashCommand::Exit),
         "model" => Ok(SlashCommand::Model),
@@ -26,6 +28,18 @@ pub fn parse_slash_command(input: &str) -> Result<SlashCommand, CommandError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_auth_command() {
+        assert!(matches!(
+            parse_slash_command("auth"),
+            Ok(SlashCommand::Auth)
+        ));
+        assert!(matches!(
+            parse_slash_command("auth extra args"),
+            Ok(SlashCommand::Auth)
+        ));
+    }
 
     #[test]
     fn parses_exit_aliases() {

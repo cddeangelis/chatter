@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::{
     api::ModelInfo,
-    app::{App, StatusKind, ViewMode},
+    app::{AUTH_PROVIDER_CHOICES, App, AuthStep, StatusKind, ViewMode},
     commands::parse_slash_command,
     custom_terminal::Frame,
 };
@@ -44,6 +44,11 @@ pub fn render(app: &App, f: &mut Frame) {
 
     if matches!(app.mode, ViewMode::ModelPicker) {
         render_model_picker(app, f, area);
+        return;
+    }
+
+    if matches!(app.mode, ViewMode::AuthWizard) {
+        render_auth_wizard(app, f, area);
         return;
     }
 
@@ -325,8 +330,9 @@ fn render_status(app: &App, f: &mut Frame, area: Rect) {
     };
 
     let hint = match app.mode {
-        ViewMode::Chat => "esc quit  ·  /model  ·  /clear",
+        ViewMode::Chat => "esc quit  ·  /auth  ·  /model  ·  /clear",
         ViewMode::ModelPicker => "↑↓ select  ·  enter pick  ·  esc back",
+        ViewMode::AuthWizard => "",
     };
 
     let left = Span::styled(format!(" {left_text}"), left_style);
@@ -482,4 +488,181 @@ fn short_count(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+pub fn mask_api_key(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    if n <= 4 {
+        return "•".repeat(n);
+    }
+    let mut out = "•".repeat(n - 4);
+    out.extend(&chars[n - 4..]);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_api_key_empty() {
+        assert_eq!(mask_api_key(""), "");
+    }
+
+    #[test]
+    fn mask_api_key_short_fully_masked() {
+        assert_eq!(mask_api_key("abcd"), "••••");
+        assert_eq!(mask_api_key("abc"), "•••");
+    }
+
+    #[test]
+    fn mask_api_key_longer_shows_last_four() {
+        assert_eq!(mask_api_key("sk-1234"), "•••1234");
+    }
+
+    #[test]
+    fn mask_api_key_long_key() {
+        assert_eq!(mask_api_key("sk-or-abcdefghABCD"), "••••••••••••••ABCD");
+    }
+}
+
+fn render_auth_wizard(app: &App, f: &mut Frame, area: Rect) {
+    let choice = AUTH_PROVIDER_CHOICES[app.auth_wizard.provider_idx];
+    let title = match app.auth_wizard.step {
+        AuthStep::SelectProvider => " setup auth ".to_string(),
+        AuthStep::EnterOrigin    => format!(" setup auth  >  {} ", choice.label()),
+        AuthStep::EnterApiKey    => format!(" setup auth  >  {} ", choice.label()),
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(palette::ACCENT))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(palette::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    block.render(area, f.buffer_mut());
+
+    let hint = match app.auth_wizard.step {
+        AuthStep::SelectProvider => "↑↓ select  ·  enter continue  ·  esc cancel",
+        AuthStep::EnterOrigin    => "enter continue  ·  esc cancel",
+        AuthStep::EnterApiKey    => "enter save  ·  esc cancel",
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+
+    match app.auth_wizard.step {
+        AuthStep::SelectProvider => render_auth_provider_list(app, f.buffer_mut(), chunks[0]),
+        AuthStep::EnterOrigin    => render_auth_text_field(
+            "Origin (e.g. https://api.together.ai)",
+            &app.auth_wizard.origin,
+            app.auth_wizard.error.as_deref(),
+            false,
+            f.buffer_mut(),
+            chunks[0],
+        ),
+        AuthStep::EnterApiKey    => render_auth_text_field(
+            "API key",
+            &app.auth_wizard.api_key,
+            app.auth_wizard.error.as_deref(),
+            true,
+            f.buffer_mut(),
+            chunks[0],
+        ),
+    }
+
+    let hint_line = Line::from(Span::styled(hint, Style::default().fg(palette::FAINT)));
+    Paragraph::new(hint_line).render(chunks[1], f.buffer_mut());
+}
+
+fn render_auth_provider_list(app: &App, buf: &mut Buffer, area: Rect) {
+    let selected = app.auth_wizard.provider_idx;
+    let label_width = AUTH_PROVIDER_CHOICES
+        .iter()
+        .map(|c| c.label().chars().count())
+        .max()
+        .unwrap_or(0);
+
+    let mut lines: Vec<Line> = vec![Line::from("")];
+    for (idx, choice) in AUTH_PROVIDER_CHOICES.iter().enumerate() {
+        let is_selected = idx == selected;
+        let cursor = if is_selected { "▶" } else { " " };
+        let pad = label_width.saturating_sub(choice.label().chars().count());
+        let label_segment = format!("  {cursor}  {}{}", choice.label(), " ".repeat(pad));
+        let (label_style, desc_style) = if is_selected {
+            (
+                Style::default().fg(palette::ACCENT).bg(palette::SELECTED_BG).add_modifier(Modifier::BOLD),
+                Style::default().fg(palette::TEXT).bg(palette::SELECTED_BG),
+            )
+        } else {
+            (
+                Style::default().fg(palette::TEXT),
+                Style::default().fg(palette::MUTED),
+            )
+        };
+        lines.push(Line::from(vec![
+            Span::styled(label_segment, label_style),
+            Span::styled(format!("  {}", choice.description()), desc_style),
+        ]));
+    }
+    Paragraph::new(lines).render(area, buf);
+}
+
+fn render_auth_text_field(
+    label: &str,
+    value: &str,
+    error: Option<&str>,
+    mask: bool,
+    buf: &mut Buffer,
+    area: Rect,
+) {
+    let display = if mask { mask_api_key(value) } else { value.to_string() };
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {label}:"),
+            Style::default().fg(palette::MUTED),
+        )),
+    ];
+
+    let field_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(palette::ACCENT_DIM));
+    let field_area = Rect {
+        x: area.x + 2,
+        y: area.y + 2,
+        width: area.width.saturating_sub(4),
+        height: 3,
+    };
+
+    if let Some(err) = error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(""));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  ⚠  {err}"),
+            Style::default().fg(palette::DANGER),
+        )));
+    }
+
+    Paragraph::new(lines).render(area, buf);
+
+    // Render the input box on top of the placeholder lines
+    let inner_field = field_block.inner(field_area);
+    field_block.render(field_area, buf);
+    Paragraph::new(Line::from(Span::styled(
+        display,
+        Style::default().fg(palette::TEXT),
+    )))
+    .render(inner_field, buf);
 }

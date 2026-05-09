@@ -1,6 +1,7 @@
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::api::ModelInfo;
+use crate::provider::Provider;
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -14,6 +15,11 @@ pub enum AppEvent {
     StreamError(String),
     ModelsLoaded(Vec<ModelInfo>),
     ModelsError(String),
+    AuthSubmit {
+        provider: Provider,
+        origin: Option<String>,
+        api_key: String,
+    },
     Resize,
 }
 
