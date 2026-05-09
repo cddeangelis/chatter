@@ -4,11 +4,8 @@ use anyhow::{Context, Result};
 use crossterm::{
     SynchronizedUpdate,
     cursor::EnableBlinking,
-    execute, queue,
-    terminal::{
-        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode,
-    },
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     backend::{Backend, CrosstermBackend},
@@ -53,11 +50,16 @@ fn bottom_anchored_viewport(screen_size: Size, cursor_y: u16, height: u16) -> Re
 }
 
 /// Resize the inline viewport to `desired_height`, keeping it bottom-anchored.
-/// When growing, scroll the terminal content above upward so the freed rows
-/// at the new viewport top are blank. When shrinking, clear the rows that are
-/// no longer covered so stale border / prefix glyphs don't linger above the
-/// input box. No-op when the viewport already covers the full screen
-/// (alt-screen / model picker).
+///
+/// Grow: scroll the rows above the viewport up via DECSTBM so the new top
+/// rows are blank; viewport contents stay put. Shrink: scroll the rows above
+/// the viewport down by the same amount so scrollback slides back into the
+/// freed rows instead of leaving a blank gap above the input box. The bottom
+/// rows of the scroll region are overwritten — fine, since the new (smaller)
+/// viewport is repainted on top of them.
+///
+/// No-op while a fullscreen view (model picker / auth wizard) owns the
+/// viewport.
 pub fn reshape_viewport(terminal: &mut Tui, desired_height: u16) -> Result<()> {
     let screen = terminal.size().context("read terminal size for reshape")?;
     let current = terminal.viewport_area;
@@ -65,7 +67,6 @@ pub fn reshape_viewport(terminal: &mut Tui, desired_height: u16) -> Result<()> {
     if screen.height == 0 || screen.width == 0 {
         return Ok(());
     }
-    // Fullscreen mode (model picker) — leave viewport alone.
     if current.height >= screen.height {
         return Ok(());
     }
@@ -77,29 +78,23 @@ pub fn reshape_viewport(terminal: &mut Tui, desired_height: u16) -> Result<()> {
 
     let new_top = screen.height - new_height;
     let new_rect = Rect::new(0, new_top, screen.width, new_height);
-    let backend = terminal.backend_mut();
 
     if new_top < current.top() {
         let scroll_by = current.top() - new_top;
-        queue!(backend, crossterm::cursor::MoveTo(0, screen.height - 1))
-            .context("queue reshape move")?;
-        for _ in 0..scroll_by {
-            backend.write_all(b"\n").context("scroll for reshape")?;
-        }
-        io::Write::flush(backend).context("flush reshape scroll")?;
+        terminal
+            .backend_mut()
+            .scroll_region_up(0..current.top(), scroll_by)
+            .context("scroll_region_up for reshape grow")?;
     } else if new_top > current.top() {
-        for y in current.top()..new_top {
-            queue!(
-                backend,
-                crossterm::cursor::MoveTo(0, y),
-                Clear(ClearType::CurrentLine),
-            )
-            .context("queue reshape clear")?;
-        }
-        io::Write::flush(backend).context("flush reshape clear")?;
+        let scroll_by = new_top - current.top();
+        terminal
+            .backend_mut()
+            .scroll_region_down(0..new_top, scroll_by)
+            .context("scroll_region_down for reshape shrink")?;
     }
 
     terminal.set_viewport_area(new_rect);
+    terminal.invalidate_viewport();
     Ok(())
 }
 

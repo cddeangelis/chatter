@@ -1,8 +1,33 @@
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SlashCommand {
     Auth,
     Clear,
     Exit,
     Model,
+}
+
+impl SlashCommand {
+    pub fn all() -> &'static [SlashCommand] {
+        &[Self::Model, Self::Auth, Self::Clear, Self::Exit]
+    }
+
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Auth  => "auth",
+            Self::Clear => "clear",
+            Self::Exit  => "exit",
+            Self::Model => "model",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Auth  => "set up an api key",
+            Self::Clear => "clear the conversation",
+            Self::Exit  => "exit chatter",
+            Self::Model => "choose a model",
+        }
+    }
 }
 
 pub enum CommandError {

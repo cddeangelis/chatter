@@ -4,6 +4,7 @@ use ratatui::text::Line;
 use crate::{
     api::{Message, ModelInfo},
     app_event::{AppEvent, AppEventSender},
+    command_popup::CommandPopup,
     commands::{CommandError, SlashCommand, parse_slash_command},
     provider::Provider,
     textarea::{TextArea, TextAreaState},
@@ -83,6 +84,29 @@ pub struct ModelPicker {
     pub scroll: usize,
     pub loading: bool,
     pub error: Option<String>,
+    pub filter: String,
+}
+
+impl ModelPicker {
+    /// Indices into `models` that match the current filter (case-insensitive
+    /// substring on id and name). Empty filter returns every index.
+    pub fn matches(&self, models: &[ModelInfo]) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return (0..models.len()).collect();
+        }
+        let needle = self.filter.to_lowercase();
+        models
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                m.id.to_lowercase().contains(&needle)
+                    || m.name
+                        .as_deref()
+                        .is_some_and(|n| n.to_lowercase().contains(&needle))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
 }
 
 pub enum StatusKind {
@@ -116,6 +140,7 @@ pub struct App {
     pub auth_wizard: AuthWizard,
     pub live: Option<LiveCell>,
     pub dirty: bool,
+    pub command_popup: Option<CommandPopup>,
 }
 
 impl App {
@@ -144,10 +169,12 @@ impl App {
                 scroll: 0,
                 loading: false,
                 error: None,
+                filter: String::new(),
             },
             auth_wizard: AuthWizard::default(),
             live: None,
             dirty: true,
+            command_popup: None,
         }
     }
 
@@ -181,6 +208,46 @@ impl App {
 
     fn handle_chat_key(&mut self, key: KeyEvent, tx: &AppEventSender) {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        if self.command_popup.is_some() {
+            match key.code {
+                KeyCode::Up => {
+                    self.command_popup.as_mut().unwrap().move_up();
+                    self.mark_dirty();
+                    return;
+                }
+                KeyCode::Down => {
+                    self.command_popup.as_mut().unwrap().move_down();
+                    self.mark_dirty();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.command_popup = None;
+                    self.mark_dirty();
+                    return;
+                }
+                KeyCode::Tab => {
+                    if let Some(cmd) = self.command_popup.as_ref().and_then(|p| p.selected()) {
+                        let autocomplete = format!("/{} ", cmd.command());
+                        self.input.clear();
+                        self.input.insert_str(&autocomplete);
+                        self.input_state = TextAreaState::default();
+                        self.sync_command_popup();
+                    }
+                    return;
+                }
+                KeyCode::Enter if !shift => {
+                    if let Some(cmd) = self.command_popup.as_ref().and_then(|p| p.selected()) {
+                        self.clear_input();
+                        self.command_popup = None;
+                        self.dispatch_slash_command(cmd, tx);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Esc => tx.send(AppEvent::Quit),
             KeyCode::Enter if !self.streaming && !shift => {
@@ -188,9 +255,25 @@ impl App {
             }
             _ if !self.streaming => {
                 self.input.input(key);
+                self.sync_command_popup();
             }
             _ => {}
         }
+    }
+
+    fn sync_command_popup(&mut self) {
+        if self.streaming {
+            self.command_popup = None;
+            return;
+        }
+        let first_line = self.input.text().lines().next().unwrap_or("").to_string();
+        if first_line.starts_with('/') {
+            let popup = self.command_popup.get_or_insert_with(CommandPopup::new);
+            popup.on_text_change(&first_line);
+        } else {
+            self.command_popup = None;
+        }
+        self.mark_dirty();
     }
 
     fn submit_input(&mut self, tx: &AppEventSender) {
@@ -198,6 +281,7 @@ impl App {
         if text.is_empty() {
             return;
         }
+        self.command_popup = None;
         if let Some(command_text) = text.strip_prefix('/') {
             self.clear_input();
             self.handle_slash_command(command_text, tx);
@@ -214,21 +298,31 @@ impl App {
 
     fn handle_slash_command(&mut self, command_text: &str, tx: &AppEventSender) {
         match parse_slash_command(command_text) {
-            Ok(SlashCommand::Auth) => self.open_auth_wizard(),
-            Ok(SlashCommand::Clear) => tx.send(AppEvent::Clear),
-            Ok(SlashCommand::Exit) => tx.send(AppEvent::Quit),
-            Ok(SlashCommand::Model) => {
+            Ok(cmd) => self.dispatch_slash_command(cmd, tx),
+            Err(CommandError::Unknown(name)) => {
+                self.status = Some(Status::info(format!("unknown command: /{name}")));
+            }
+            Err(CommandError::Empty) => {
+                let hint: Vec<&str> = SlashCommand::all().iter().map(|c| c.command()).collect();
+                self.status = Some(Status::info(format!(
+                    "type /{}",
+                    hint.join(", /")
+                )));
+            }
+        }
+    }
+
+    fn dispatch_slash_command(&mut self, cmd: SlashCommand, tx: &AppEventSender) {
+        match cmd {
+            SlashCommand::Auth => self.open_auth_wizard(),
+            SlashCommand::Clear => tx.send(AppEvent::Clear),
+            SlashCommand::Exit => tx.send(AppEvent::Quit),
+            SlashCommand::Model => {
                 self.open_model_picker();
                 if self.models.is_empty() {
                     self.model_picker.loading = true;
                     tx.send(AppEvent::LoadModels);
                 }
-            }
-            Err(CommandError::Unknown(name)) => {
-                self.status = Some(Status::info(format!("unknown command: /{name}")));
-            }
-            Err(CommandError::Empty) => {
-                self.status = Some(Status::info("type /auth, /clear, /exit, or /model"));
             }
         }
     }
@@ -238,10 +332,10 @@ impl App {
             KeyCode::Esc => {
                 self.close_model_picker();
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 self.move_model_selection(-1);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 self.move_model_selection(1);
             }
             KeyCode::PageUp => {
@@ -255,14 +349,29 @@ impl App {
                 self.keep_selected_model_visible();
             }
             KeyCode::End => {
-                self.model_picker.selected = self.models.len().saturating_sub(1);
+                let last = self.model_picker.matches(&self.models).len().saturating_sub(1);
+                self.model_picker.selected = last;
                 self.keep_selected_model_visible();
             }
-            KeyCode::Enter if !self.models.is_empty() => {
-                let model = self.models[self.model_picker.selected].id.clone();
-                self.set_current_model(model.clone());
-                self.close_model_picker();
-                tx.send(AppEvent::SelectModel(model));
+            KeyCode::Enter => {
+                let matches = self.model_picker.matches(&self.models);
+                if let Some(&idx) = matches.get(self.model_picker.selected) {
+                    let model = self.models[idx].id.clone();
+                    self.set_current_model(model.clone());
+                    self.close_model_picker();
+                    tx.send(AppEvent::SelectModel(model));
+                }
+            }
+            KeyCode::Backspace => {
+                if self.model_picker.filter.pop().is_some() {
+                    self.refresh_model_filter();
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if (c as u32) >= 32 && (c as u32) != 127 {
+                    self.model_picker.filter.push(c);
+                    self.refresh_model_filter();
+                }
             }
             _ => {}
         }
@@ -378,6 +487,8 @@ impl App {
     fn open_model_picker(&mut self) {
         self.mode = ViewMode::ModelPicker;
         self.model_picker.error = None;
+        self.model_picker.filter.clear();
+        self.model_picker.scroll = 0;
         self.select_current_model();
         self.keep_selected_model_visible();
     }
@@ -547,23 +658,19 @@ impl App {
     }
 
     fn select_current_model(&mut self) {
-        if let Some(idx) = self
-            .models
+        let matches = self.model_picker.matches(&self.models);
+        let position = matches
             .iter()
-            .position(|model| model.id == self.current_model)
-        {
-            self.model_picker.selected = idx;
-        } else {
-            self.model_picker.selected = 0;
-        }
+            .position(|&i| self.models[i].id == self.current_model);
+        self.model_picker.selected = position.unwrap_or(0);
     }
 
     fn move_model_selection(&mut self, delta: isize) {
-        if self.models.is_empty() {
+        let len = self.model_picker.matches(&self.models).len();
+        if len == 0 {
             return;
         }
-
-        let max = self.models.len() - 1;
+        let max = len - 1;
         let selected = self.model_picker.selected.saturating_add_signed(delta);
         self.model_picker.selected = selected.min(max);
         self.keep_selected_model_visible();
@@ -573,6 +680,17 @@ impl App {
         let selected = self.model_picker.selected;
         if selected < self.model_picker.scroll {
             self.model_picker.scroll = selected;
+        }
+    }
+
+    fn refresh_model_filter(&mut self) {
+        let len = self.model_picker.matches(&self.models).len();
+        if len == 0 {
+            self.model_picker.selected = 0;
+            self.model_picker.scroll = 0;
+        } else {
+            self.model_picker.selected = self.model_picker.selected.min(len - 1);
+            self.model_picker.scroll = self.model_picker.scroll.min(self.model_picker.selected);
         }
     }
 

@@ -359,7 +359,10 @@ fn reshape_for_input(terminal: &mut crate::terminal::Tui, app: &App) -> Result<(
     let screen = terminal.size()?;
     let text_width = ui::input_text_width(screen.width);
     let input_rows = app.input.desired_height(text_width);
-    let desired = input_rows.saturating_add(ui::INPUT_CHROME_ROWS);
+    let popup_rows = app.command_popup.as_ref().map_or(0, |p| p.desired_height());
+    let desired = input_rows
+        .saturating_add(ui::INPUT_CHROME_ROWS)
+        .saturating_add(popup_rows);
     terminal::reshape_viewport(terminal, desired)
 }
 

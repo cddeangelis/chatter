@@ -9,7 +9,7 @@ use ratatui::{
 use crate::{
     api::ModelInfo,
     app::{AUTH_PROVIDER_CHOICES, App, AuthStep, StatusKind, ViewMode},
-    commands::parse_slash_command,
+    commands::{SlashCommand, parse_slash_command},
     custom_terminal::Frame,
 };
 
@@ -22,7 +22,7 @@ pub const PROMPT_PREFIX_WIDTH: u16 = 3;
 /// the total viewport height.
 pub const INPUT_CHROME_ROWS: u16 = 3;
 
-mod palette {
+pub(crate) mod palette {
     use ratatui::style::Color;
     pub const ACCENT: Color = Color::Rgb(244, 162, 89);
     pub const ACCENT_DIM: Color = Color::Rgb(155, 105, 60);
@@ -54,13 +54,28 @@ pub fn render(app: &mut App, f: &mut Frame) {
     let text_width = input_text_width(area.width);
     let input_rows = app.input.desired_height(text_width);
     let input_height = input_rows.saturating_add(2);
+
+    let popup_height = app.command_popup.as_ref().map_or(0, |p| p.desired_height());
+    let mut constraints: Vec<Constraint> = Vec::new();
+    if popup_height > 0 {
+        constraints.push(Constraint::Length(popup_height));
+    }
+    constraints.push(Constraint::Length(input_height));
+    constraints.push(Constraint::Length(1));
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(input_height), Constraint::Length(1)])
+        .constraints(constraints)
         .split(area);
 
-    render_input(app, f, chunks[0]);
-    render_status(app, f, chunks[1]);
+    let mut idx = 0;
+    if let Some(popup) = app.command_popup.as_ref() {
+        popup.render(chunks[idx], f.buffer_mut());
+        idx += 1;
+    }
+    render_input(app, f, chunks[idx]);
+    idx += 1;
+    render_status(app, f, chunks[idx]);
 }
 
 /// Render lines for a user message about to be pushed to scrollback.
@@ -272,8 +287,15 @@ fn render_status(app: &App, f: &mut Frame, area: Rect) {
         }
     };
 
-    let hint = match app.mode {
-        ViewMode::Chat => "esc quit  ·  /auth  ·  /model  ·  /clear",
+    let chat_hint: String = {
+        let cmds: Vec<String> = SlashCommand::all()
+            .iter()
+            .map(|c| format!("/{}", c.command()))
+            .collect();
+        format!("esc quit  ·  {}", cmds.join("  ·  "))
+    };
+    let hint: &str = match app.mode {
+        ViewMode::Chat => &chat_hint,
         ViewMode::ModelPicker => "↑↓ select  ·  enter pick  ·  esc back",
         ViewMode::AuthWizard => "",
     };
@@ -296,12 +318,17 @@ fn style_for_status(kind: &StatusKind) -> Style {
 }
 
 fn render_model_picker(app: &App, f: &mut Frame, area: Rect) {
+    let title = if app.model_picker.filter.is_empty() {
+        " select model ".to_string()
+    } else {
+        format!(" select model · filter: {} ", app.model_picker.filter)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(palette::ACCENT))
         .title(Span::styled(
-            " select model ",
+            title,
             Style::default()
                 .fg(palette::ACCENT)
                 .add_modifier(Modifier::BOLD),
@@ -309,10 +336,7 @@ fn render_model_picker(app: &App, f: &mut Frame, area: Rect) {
     let inner = block.inner(area);
     block.render(area, f.buffer_mut());
 
-    let hint = match app.mode {
-        ViewMode::ModelPicker => "↑↓ select · enter pick · esc back",
-        _ => "",
-    };
+    let hint = "type to filter · ↑↓ select · enter pick · esc back";
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -358,24 +382,36 @@ fn render_picker_list(app: &App, buf: &mut Buffer, area: Rect) {
         return;
     }
 
+    let matches = app.model_picker.matches(&app.models);
+    if matches.is_empty() {
+        Paragraph::new(Line::from(Span::styled(
+            format!("  no models match \"{}\"", app.model_picker.filter),
+            Style::default()
+                .fg(palette::MUTED)
+                .add_modifier(Modifier::ITALIC),
+        )))
+        .render(area, buf);
+        return;
+    }
+
     let selected = app.model_picker.selected;
     let mut start = app.model_picker.scroll.min(selected);
     if list_height > 0 && selected >= start.saturating_add(list_height) {
         start = selected.saturating_sub(list_height.saturating_sub(1));
     }
 
-    let id_width = app
-        .models
+    let id_width = matches
         .iter()
         .skip(start)
         .take(list_height)
-        .map(|model| model.id.chars().count())
+        .map(|&i| app.models[i].id.chars().count())
         .max()
         .unwrap_or(0);
 
     let mut lines: Vec<Line> = Vec::new();
-    for (idx, model) in app.models.iter().enumerate().skip(start).take(list_height) {
-        let is_selected = idx == selected;
+    for (row, &model_idx) in matches.iter().enumerate().skip(start).take(list_height) {
+        let model = &app.models[model_idx];
+        let is_selected = row == selected;
         let is_current = model.id == app.current_model;
         let cursor = if is_selected { "▶" } else { " " };
         let dot = if is_current { "●" } else { "·" };

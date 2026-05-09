@@ -293,6 +293,14 @@ where
         self.current = 1 - self.current;
     }
 
+    /// Force the next draw to repaint the entire viewport. Call this after any
+    /// operation that mutates screen contents outside ratatui's diff tracking
+    /// (raw scroll-region writes, viewport resizes that shift content), since
+    /// the previous-frame buffer's cell-position assumptions are now wrong.
+    pub fn invalidate_viewport(&mut self) {
+        self.previous_buffer_mut().reset();
+    }
+
     pub fn size(&self) -> io::Result<Size> {
         self.backend.size()
     }

@@ -1,6 +1,7 @@
 pub mod api;
 pub mod provider;
 pub mod app;
+pub mod command_popup;
 pub mod app_event;
 pub mod commands;
 pub mod config;
