@@ -20,6 +20,8 @@ pub struct ModelInfo {
     pub name: Option<String>,
     pub context_length: Option<u64>,
     pub max_output_tokens: Option<u64>,
+    pub input_price_per_mtok: Option<f64>,
+    pub output_price_per_mtok: Option<f64>,
 }
 
 // ── Anthropic request / SSE types ────────────────────────────────────────────
@@ -107,11 +109,18 @@ struct OrModelItem {
     name: Option<String>,
     context_length: Option<u64>,
     top_provider: Option<OrTopProvider>,
+    pricing: Option<OrPricing>,
 }
 
 #[derive(Deserialize)]
 struct OrTopProvider {
     max_completion_tokens: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct OrPricing {
+    prompt: Option<String>,
+    completion: Option<String>,
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -274,6 +283,8 @@ async fn fetch_models_anthropic(client: &reqwest::Client, config: &Config) -> Re
             name: item.display_name,
             context_length: None,
             max_output_tokens: None,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
         })
         .collect())
 }
@@ -353,11 +364,21 @@ async fn fetch_models_openrouter(client: &reqwest::Client, config: &Config) -> R
         .context("failed to decode OpenRouter models response")?
         .data
         .into_iter()
-        .map(|item| ModelInfo {
-            id: item.id,
-            name: item.name,
-            context_length: item.context_length,
-            max_output_tokens: item.top_provider.and_then(|p| p.max_completion_tokens),
+        .map(|item| {
+            let per_mtok = |s: Option<String>| -> Option<f64> {
+                s?.parse::<f64>().ok().map(|v| v * 1_000_000.0)
+            };
+            let (input_price, output_price) = item.pricing.map_or((None, None), |p| {
+                (per_mtok(p.prompt), per_mtok(p.completion))
+            });
+            ModelInfo {
+                id: item.id,
+                name: item.name,
+                context_length: item.context_length,
+                max_output_tokens: item.top_provider.and_then(|p| p.max_completion_tokens),
+                input_price_per_mtok: input_price,
+                output_price_per_mtok: output_price,
+            }
         })
         .collect())
 }

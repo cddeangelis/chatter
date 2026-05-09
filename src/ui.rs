@@ -447,8 +447,11 @@ fn render_picker_list(app: &App, buf: &mut Buffer, area: Rect) {
 
 fn format_model_meta(model: &ModelInfo) -> String {
     let mut parts = Vec::new();
-    if let Some(name) = model.name.as_deref().filter(|s| !s.is_empty()) {
-        parts.push(name.to_string());
+    match (model.input_price_per_mtok, model.output_price_per_mtok) {
+        (Some(i), Some(o)) => parts.push(format!("${}/MTok in · ${}/MTok out", fmt_price(i), fmt_price(o))),
+        (Some(i), None)    => parts.push(format!("${}/MTok in", fmt_price(i))),
+        (None,    Some(o)) => parts.push(format!("${}/MTok out", fmt_price(o))),
+        (None,    None)    => {}
     }
     if let Some(ctx) = model.context_length {
         parts.push(format!("ctx: {}", short_count(ctx)));
@@ -457,6 +460,14 @@ fn format_model_meta(model: &ModelInfo) -> String {
         parts.push(format!("max-out: {}", short_count(max)));
     }
     parts.join(" · ")
+}
+
+fn fmt_price(v: f64) -> String {
+    if v == 0.0 {
+        return "0".to_string();
+    }
+    let s = format!("{:.4}", v);
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 fn short_count(n: u64) -> String {
