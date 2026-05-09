@@ -394,22 +394,24 @@ fn render_picker_list(app: &App, buf: &mut Buffer, area: Rect) {
         return;
     }
 
+    let model_rows = list_height.saturating_sub(1);
     let selected = app.model_picker.selected;
     let mut start = app.model_picker.scroll.min(selected);
-    if list_height > 0 && selected >= start.saturating_add(list_height) {
-        start = selected.saturating_sub(list_height.saturating_sub(1));
+    if model_rows > 0 && selected >= start.saturating_add(model_rows) {
+        start = selected.saturating_sub(model_rows.saturating_sub(1));
     }
 
     let id_width = matches
         .iter()
         .skip(start)
-        .take(list_height)
+        .take(model_rows)
         .map(|&i| app.models[i].id.chars().count())
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max("model".len());
 
-    let mut lines: Vec<Line> = Vec::new();
-    for (row, &model_idx) in matches.iter().enumerate().skip(start).take(list_height) {
+    let mut lines: Vec<Line> = vec![build_header_line(id_width)];
+    for (row, &model_idx) in matches.iter().enumerate().skip(start).take(model_rows) {
         let model = &app.models[model_idx];
         let is_selected = row == selected;
         let is_current = model.id == app.current_model;
@@ -430,7 +432,7 @@ fn render_picker_list(app: &App, buf: &mut Buffer, area: Rect) {
             Style::default().fg(palette::TEXT)
         };
         let mut spans = vec![Span::styled(id_segment, id_style)];
-        let meta = format_model_meta(model);
+        let meta = format_model_meta_cols(model);
         if !meta.is_empty() {
             let meta_style = if is_selected {
                 Style::default().fg(palette::TEXT).bg(palette::SELECTED_BG)
@@ -445,21 +447,25 @@ fn render_picker_list(app: &App, buf: &mut Buffer, area: Rect) {
     Paragraph::new(lines).render(area, buf);
 }
 
-fn format_model_meta(model: &ModelInfo) -> String {
-    let mut parts = Vec::new();
-    match (model.input_price_per_mtok, model.output_price_per_mtok) {
-        (Some(i), Some(o)) => parts.push(format!("${}/MTok in · ${}/MTok out", fmt_price(i), fmt_price(o))),
-        (Some(i), None)    => parts.push(format!("${}/MTok in", fmt_price(i))),
-        (None,    Some(o)) => parts.push(format!("${}/MTok out", fmt_price(o))),
-        (None,    None)    => {}
+fn build_header_line(id_width: usize) -> Line<'static> {
+    let style = Style::default().fg(palette::FAINT).add_modifier(Modifier::BOLD);
+    let text = format!(
+        "       {:<id_width$}  {:<8}{:<8}{:<6}{}",
+        "model", "in", "out", "ctx", "max",
+        id_width = id_width
+    );
+    Line::from(Span::styled(text, style))
+}
+
+fn format_model_meta_cols(model: &ModelInfo) -> String {
+    let in_val  = model.input_price_per_mtok.map(|v| format!("${}", fmt_price(v))).unwrap_or_default();
+    let out_val = model.output_price_per_mtok.map(|v| format!("${}", fmt_price(v))).unwrap_or_default();
+    let ctx_val = model.context_length.map(short_count).unwrap_or_default();
+    let max_val = model.max_output_tokens.map(short_count).unwrap_or_default();
+    if in_val.is_empty() && out_val.is_empty() && ctx_val.is_empty() && max_val.is_empty() {
+        return String::new();
     }
-    if let Some(ctx) = model.context_length {
-        parts.push(format!("ctx: {}", short_count(ctx)));
-    }
-    if let Some(max) = model.max_output_tokens {
-        parts.push(format!("max-out: {}", short_count(max)));
-    }
-    parts.join(" · ")
+    format!("{:<8}{:<8}{:<6}{}", in_val, out_val, ctx_val, max_val)
 }
 
 fn fmt_price(v: f64) -> String {
